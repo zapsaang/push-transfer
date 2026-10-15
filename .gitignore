@@ -1,0 +1,19 @@
+# Python 字节码缓存（会把 env.py 里的密钥编译进 .pyc，不要提交）
+__pycache__/
+*.py[cod]
+
+# 本地环境变量文件
+.env
+.env.*
+!.env.example
+
+# 日志与临时目录
+log/
+*.log
+
+# 系统临时文件
+.DS_Store
+**/.DS_Store
+
+# 本地文档与审计记录（不公开提交）
+docs/
