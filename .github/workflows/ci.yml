@@ -76,7 +76,7 @@ jobs:
 
       # 配置为 .golangci.yml 的 v2 格式；仓库红线要求 0 issues。
       - name: golangci-lint
-        uses: golangci-lint/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.15.0
           args: --timeout=5m
