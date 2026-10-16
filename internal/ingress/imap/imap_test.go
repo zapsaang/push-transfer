@@ -1423,7 +1423,12 @@ func TestListener_UnresponsiveServerTimeoutAndShutdown(t *testing.T) {
 		}
 
 		select {
-		case <-done:
+		case err := <-done:
+			// Context cancellation is the clean shutdown path, so Start must
+			// hand back nil; any other value means an unexpected exit reason.
+			if err != nil {
+				t.Fatalf("listener.Start returned %v after cancel, want nil", err)
+			}
 		case <-time.After(200 * time.Millisecond):
 			t.Fatal("listener.Start did not exit after cancel")
 		}
