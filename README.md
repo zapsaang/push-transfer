@@ -1,5 +1,6 @@
 # PushTransfer
 
+[![CI](https://github.com/zapsaang/push-transfer/actions/workflows/ci.yml/badge.svg)](https://github.com/zapsaang/push-transfer/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/badge/Go-1.26.8+-00ADD8?style=flat&logo=go)](go.mod)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker)](https://www.docker.com/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -521,18 +522,24 @@ time=2026-10-16T18:00:00.000Z level=INFO msg="starting HTTP webhook server" addr
 
 ## 开发与测试
 
-在提交代码或对逻辑进行修改时，建议先执行完整的代码静态检查与单测套件：
+在提交代码或对逻辑进行修改时，建议先执行完整的代码静态检查与单测套件（与 CI 门禁一致，见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)）：
 
 ```bash
 # 1. 编译静态二进制
 go build -v -o push-transfer ./cmd/push-transfer
 
-# 2. 运行严格静态代码扫描 (保持 0 issues)
+# 2. 运行严格静态代码扫描 (保持 0 issues)，并校验格式与 vet
 golangci-lint run ./...
+gofmt -l .          # 必须无输出
+go vet ./...        # 必须无输出
 
 # 3. 运行全量单元测试与并发竞态检测 (-race)
 go test -race -v -cover ./...
 ```
+
+每次 push 到 `main` 或提交 Pull Request 都会触发 GitHub Actions 自动执行上述检查
+（`gofmt` / `go vet` / `go test -race -cover` / `golangci-lint`）；本地通过不代表 CI 通过，
+合并前请以 CI 绿色为准。
 
 ---
 
