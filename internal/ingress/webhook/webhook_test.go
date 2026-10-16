@@ -630,7 +630,7 @@ func TestWebhook_RealIP(t *testing.T) {
 }
 
 // TestWebhook_QueryTokenAuth covers the `?token=` authentication path that the
-// Python-era clients use (shell/auth.py requires_token) and that README documents.
+// legacy clients use and that README documents.
 func TestWebhook_QueryTokenAuth(t *testing.T) {
 	const validToken = "query-token-xyz"
 
@@ -717,7 +717,7 @@ func TestWebhook_QueryTokenAuth(t *testing.T) {
 }
 
 // TestWebhook_UnauthorizedChallenge verifies the WWW-Authenticate challenge required
-// by RFC 9110 section 15.5.2 for HTTP Basic Auth (shell/auth.py sent it too).
+// by RFC 9110 section 15.5.2 for HTTP Basic Auth (the legacy implementation sent it too).
 func TestWebhook_UnauthorizedChallenge(t *testing.T) {
 	t.Run("Basic Auth configured advertises the Basic challenge", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{

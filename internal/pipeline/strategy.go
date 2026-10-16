@@ -14,8 +14,8 @@ type Strategy interface {
 	Process(msg *model.Message) (bool, error)
 }
 
-// Pipeline coordinates message processing stages based on msg.MsgType,
-// matching the behavior of Python consts.PROCESS_STRATEGY_PATTERN_BY_MSG_TYPE.
+// Pipeline coordinates message processing stages based on msg.MsgType, keeping
+// the historical per-type strategy chain of the removed Python implementation.
 type Pipeline struct {
 	filter    Strategy
 	captcha   Strategy
@@ -70,7 +70,7 @@ func (p *Pipeline) Process(msg *model.Message) (bool, error) {
 
 	switch msg.MsgType {
 	case "call":
-		// Python consts: PROCESS_STRATEGY_PATTERN_BY_MSG_TYPE["call"] = []
+		// Calls carry no content to filter: the legacy chain for "call" was empty.
 		return true, nil
 
 	case "text", "":
@@ -111,7 +111,7 @@ func (p *Pipeline) Process(msg *model.Message) (bool, error) {
 	}
 }
 
-// Execute is an alias for Process to align with Python process.execute naming.
+// Execute is an alias for Process kept for the legacy entry-point naming.
 func (p *Pipeline) Execute(msg *model.Message) (bool, error) {
 	return p.Process(msg)
 }

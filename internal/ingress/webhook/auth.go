@@ -39,9 +39,10 @@ func ExtractBearerToken(r *http.Request) string {
 
 // ExtractQueryToken returns the `token` query parameter.
 //
-// It exists for compatibility with the Python-era clients (see shell/auth.py
-// requires_token) and is documented in README as an alternative to the
-// Authorization header. Callers must compare the result in constant time.
+// It exists for compatibility with the legacy clients (the removed Python
+// implementation read the same parameter) and is documented in README as an
+// alternative to the Authorization header. Callers must compare the result in
+// constant time.
 func ExtractQueryToken(r *http.Request) string {
 	if r == nil || r.URL == nil {
 		return ""

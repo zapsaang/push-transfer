@@ -83,7 +83,7 @@ func TestParser_RFC2047Subject(t *testing.T) {
 			"Hello World",
 			"Weekly Newsletter",
 			"PushTransfer Other Trigger",
-			"pushtransfer email trigger", // Case sensitive in Python: 'PushTransfer Email Trigger'
+			"pushtransfer email trigger", // matching is case sensitive: 'PushTransfer Email Trigger'
 		}
 		for _, s := range subjects {
 			decoded, err := imap.DecodeSubject(s)

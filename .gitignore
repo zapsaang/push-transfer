@@ -1,7 +1,3 @@
-# Python 字节码缓存（会把 env.py 里的密钥编译进 .pyc，不要提交）
-__pycache__/
-*.py[cod]
-
 # 本地环境变量文件
 .env
 .env.*

@@ -104,7 +104,8 @@ func firstValidTimestamp(candidates ...FlexibleTimestamp) FlexibleTimestamp {
 	return 0
 }
 
-// GenComplexText generates human-readable multi-channel text matching Python gen_complex_text behavior.
+// GenComplexText generates human-readable multi-channel text in the historical
+// text format of the removed Python implementation.
 func (m *Message) GenComplexText(loc ...*time.Location) string {
 	var l *time.Location
 	if len(loc) > 0 && loc[0] != nil {

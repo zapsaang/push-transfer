@@ -17,8 +17,8 @@
 ```mermaid
 flowchart TD
     subgraph Ingress["输入接入层 (Ingress)"]
-        WH["Webhook 入口 (main.py: /webhook)"]
-        TR["IMAP 邮件轮询 (trigger.py: UNSEEN)"]
+        WH["Webhook 入口 (internal/ingress/webhook: /webhook)"]
+        TR["IMAP 邮件触发 (internal/ingress/imap: IDLE / UNSEEN)"]
     end
 
     subgraph Pipeline["策略处理管道 (Process)"]
@@ -39,23 +39,9 @@ flowchart TD
     Pipeline -->|放行后的 Message| Egress
 ```
 
-#### 文件职责清单 (Python 历史实现与参考)
+> 历史 Python 实现 (`shell/*.py`) 已整体移除，仅保留在 git 历史中；当前仓库**只有 Go 实现**。
 
-| 文件 | 职责 | 核心依赖 / 规范 |
-|------|------|----------------|
-| `shell/main.py` | HTTP 服务入口与路由挂载。提供 `/webhook` 接口，负责反向代理头适配 (`ProxyFix`)、Token 校验与流程串联。 | Flask, ProxyFix |
-| `shell/trigger.py` | 主动拉取入口。通过 IMAP SSL 定期轮询未读邮件，解包邮件主题与正文并转入处理管道。 | `imaplib`, `email`, 后台 `deliver_loop` 线程 |
-| `shell/process.py` | 消息处理策略管道。实现白名单/黑名单过滤 (`Filter`)、验证码提取 (`Captcha`)、紧急呼叫识别 (`Emergency`)。 | 策略模式，基于 `re` |
-| `shell/deliver.py` | 消息分发出口。实现 Bark HTTP 推送、Telegram Bot API 发送、SMTP 邮件发送及控制台打印。 | `requests`, `python-telegram-bot`, `smtplib` |
-| `shell/model.py` | 统一数据契约。定义 `Message` 数据载体，封装来电/短信的时间、电量、内容、验证码与紧急状态。 | 纯数据模型 |
-| `shell/auth.py` | 认证装饰器。提供基于 HTTP Basic 的 `requires_login` 与 Bearer Token/Query 的 `requires_token`。 | Flask 装饰器 |
-| `shell/env.py` | 运行配置中心。启动时强校验读取环境变量，不落地任何明文密钥。 | `os.environ`, `json` |
-| `shell/consts.py` | 全局常量与策略路由映射表。定义消息类型、各类型启用的策略链路和分发目标。 | 纯配置映射 |
-| `shell/utils.py` | 基础工具函数。异步包装、时间戳格式化、布尔转换。 | 基础工具 |
-| `shell/response.py` | 统一 HTTP 响应封装。标准化成功与失败返回结构。 | 纯函数 |
-| `shell/init.py` | **历史遗留的容器启动引导脚本**。存在严重设计缺陷与路径硬编码，不建议继续扩展。 | 应逐步废弃并替换为标准声明式管理 |
-
-#### 文件职责清单 (Go 现代化生产架构 - 推荐)
+#### 文件职责清单
 
 | 目录 / 文件 | 职责 | 核心依赖 / 规范 |
 |------------|------|----------------|
@@ -75,15 +61,15 @@ flowchart TD
 在对本仓库进行任何维护或修改时，**严禁违背以下契约**：
 
 1. **严禁在日志与回显中使用外部 Shell (无 `os.system`)**：
-   - 外部传入的短信内容、发件人等属于不可信输入。**绝对禁止**将 `msg.content` 或任何变量直接拼接到 `os.system` / `echo` 中执行，避免产生远程命令执行 (RCE) 漏洞。日志输出必须统一使用结构化日志 (`log/slog`)、Python 标准 `logging` 模块或内建 `print()`。
+   - 外部传入的短信内容、发件人等属于不可信输入。**绝对禁止**将 `msg.content` 或任何变量直接拼接到 `os.system` / `echo` 中执行，避免产生远程命令执行 (RCE) 漏洞。日志输出必须统一使用结构化日志 (`log/slog`)。
 2. **时间戳容错、多级回退与并发副本隔离**：
    - 移动端上报的时间戳可能为 `None`/`null`，或为 13 位毫秒级时间戳。必须防御空值并在时间戳大于 `1e11` 时自动转为秒，通过多级候选字段回退 (`IncomingTime`/`TransmitTime`/`ReceiveTime`/`SendTime`/`Timestamp`) 渲染时间；并发分发时必须通过 `msg.Clone()` 隔离各下游通道的实体副本。
 3. **安全比较与双鉴权 (Timing Attack Defense)**：
-   - 认证凭据（Bearer Token、HTTP Basic Auth 用户名与密码）比对必须使用恒定时间比较（Go `crypto/subtle.ConstantTimeCompare` / Python `hmac.compare_digest`），禁止使用 `==` 进行裸字符串比对。
+   - 认证凭据（Bearer Token、HTTP Basic Auth 用户名与密码）比对必须使用恒定时间比较（`crypto/subtle.ConstantTimeCompare`），禁止使用 `==` 进行裸字符串比对。
 4. **网络 I/O 必须显式声明全链路超时与请求体上限 (Timeout & MaxBytes)**：
    - 所有的外部网络调用（HTTP Client/Server、SMTP 建连与协议交互 `conn.SetDeadline`、IMAP TLS 拨号与 IDLE、Telegram/Bark 调用）必须显式指定超时，Webhook 请求体必须通过 `http.MaxBytesReader` 限制体积（默认 1MB），防止慢速攻击、对端挂起或超大请求导致进程阻塞或 OOM。
 5. **事件循环与并发边界清晰**：
-   - Go 实现中所有后台服务协程（IMAP Listener 与 HTTP Webhook Server）必须对称纳入 `sync.WaitGroup` 生命周期管理，且严禁在实例运行期调用 `slog.SetDefault` 污染全局状态；Python 历史实现中严禁在 `async def` 协程函数中混入同步阻塞网络调用。
+   - 所有后台服务协程（IMAP Listener 与 HTTP Webhook Server）必须对称纳入 `sync.WaitGroup` 生命周期管理，且严禁在实例运行期调用 `slog.SetDefault` 污染全局状态。
 6. **HTTP 状态码与 IMAP 消费语义符合真实状态**：
    - `/webhook` 在认证失败时必须返回 `401`；JSON 解析失败返回 `400`；请求体超限返回 `413`；投递下游全部失败或不可恢复错误返回 `5xx`。IMAP 触发器在下游投递失败时必须保留 `UNSEEN` 状态并在会话内退避重试，仅在投递成功或确认为永久损坏的毒丸邮件时标记 `\Seen`。
 7. **配置单源事实 (SSoT) 与按需加载**：
@@ -95,15 +81,17 @@ flowchart TD
 
 > 说明：`docs/` 已被 `.gitignore` 排除（本地审计记录，不随仓库分发），因此下列链接仅在本地工作副本中存在。
 
-完整且详细的代码审计条目、复现机理与整改路线见文档 [`docs/audit-report.md`](./docs/audit-report.md)、[`docs/go-architecture-audit.md`](./docs/go-architecture-audit.md) 与 [`docs/remediation-plan.md`](./docs/remediation-plan.md)；对应的 Go 语言重构演进设计方案见 [`docs/go-migration-plan.md`](./docs/go-migration-plan.md)。以下为维护和重构时必须逐一注意的关键陷阱：
+完整且详细的代码审计条目、复现机理与整改路线见文档 [`docs/audit-report.md`](./docs/audit-report.md)、[`docs/go-architecture-audit.md`](./docs/go-architecture-audit.md) 与 [`docs/remediation-plan.md`](./docs/remediation-plan.md)；对应的 Go 语言重构演进设计方案见 [`docs/go-migration-plan.md`](./docs/go-migration-plan.md)。
 
-- **RCE 漏洞 (utils.py)**: `print_with_time` 中含有 `os.system(f'echo "... {content}"')`，任何包含反引号、分号、`$()` 的短信都会导致服务端任意代码执行。
-- **静态 IV 复用 (deliver.py)**: `crypt_for_bark` 命名为 ECB 但使用了 CBC 模式，且从配置中读取静态固定的 IV。CBC 模式必须使用随机 IV，复用 IV 破坏加密机密性。
-- **IMAP 忙等死循环 (trigger.py)**: `_waiting_for_email_sync` 异常捕获块未设置任何延时直接重新循环，网络断开时会导致 100% CPU 忙等与邮件服务器封号。同时每秒轮询容易被识别为滥用。
-- **邮件主题多段解码截断 (trigger.py)**: `decode_header` 返回值为解码分段列表，仅取 `[0]` 会丢失主题后续文字；遇 `None` 时会抛出 TypeError。
-- **验证码提取捕获组丢失 (process.py)**: `captcha_code.group()` 仅取整串匹配；当正则声明了捕获组（如 `r'验证码[是为：:]\s*(\d{4,6})'`）时，应优先读取 `group(1)`。
-- **策略映射常量拼写 (process.py)**: `strategy_map` 错误使用了 `consts.ENUM_DELIVER_TARGET_DEFAULT` 作为处理策略的 key。
-- **启动脚本自毁风险 (init.py)**: 启动时全量 `pip install -U`、硬编码 `/root/shell` 路径，并对 `main.py` 的 import 做正则安装，属于严重违背可复现环境与单源纪律的历史代码，应重构为标准化配置。
+Python 历史实现已于本次改动整体移除（`shell/*.py` 只存在于 git 历史），但下列历史缺陷正是上面「核心契约」的由来，维护时**不得回退**：
+
+- **RCE 漏洞（原 `utils.py`）**: `print_with_time` 拼接 `os.system(f'echo "... {content}"')`，任何含反引号、分号、`$()` 的短信都会触发服务端任意代码执行。现由 `log/slog` 结构化日志替代。
+- **静态 IV 复用（原 `deliver.py`）**: 名为 ECB 实为 CBC，且 IV 来自配置恒定不变，破坏加密机密性。现为每消息随机 IV，`iv` 与 `ciphertext` 作为两个独立顶层参数下发。
+- **IMAP 忙等死循环（原 `trigger.py`）**: 异常分支无退避直接重试，断网时 100% CPU 并易被邮件服务商封号。现为 IDLE 长连接 + 指数退避（含抖动）。
+- **邮件主题多段解码截断（原 `trigger.py`）**: `decode_header` 仅取 `[0]`，丢弃多段 RFC 2047 主题且遇 `None` 抛 `TypeError`。现为多段安全解码。
+- **验证码捕获组丢失（原 `process.py`）**: 只取整体匹配，正则捕获组失效。现优先读取第 1 捕获组。
+- **策略映射常量拼写（原 `process.py`）**: `strategy_map` 误用投递目标常量作为处理策略 key。现为按 `MsgType` 显式分支。
+- **启动脚本自毁风险（原 `init.py`）**: 全量 `pip install -U`、硬编码 `/root/shell`、对 import 做正则安装。现由标准二进制/容器镜像与 `.env` 声明式配置替代。
 
 ---
 
@@ -111,7 +99,8 @@ flowchart TD
 
 在声称“完成/修好”之前，必须真实执行验证命令并输出结果。
 
-#### 1. Go 实现构建与验证 (生产环境推荐)
+#### 构建、静态检查与单元测试
+
 ```bash
 # 1. 静态单二进制构建
 go build -v -o push-transfer ./cmd/push-transfer
@@ -119,26 +108,18 @@ go build -v -o push-transfer ./cmd/push-transfer
 # 2. 严格代码质量与静态检查 (必须保持 0 issues)
 golangci-lint run ./...   # 配置为 v2 格式；同时校验 gofmt（formatters.gofmt）
 gofmt -l .                # 必须无输出
+go vet ./...              # 必须无输出
 
 # 3. 运行全量单元测试、并发竞态检测 (-race) 与覆盖率统计
-go test -race -v -cover ./...
+go test -race -cover ./...
 ```
 
-#### 2. Python 历史版本语法与静态检查
-```bash
-# 检查所有 Python 脚本语法
-python3 -m py_compile shell/*.py
-```
+#### CI 流水线
 
-#### 3. Python 安全与逻辑单测 (离线验证)
-可在本地运行 mock 单测，验证关键修复（如命令注入消除、时间戳兼容、邮件解码等）：
-```bash
-# 验证 utils.print_with_time 不再调用外部 shell
-python3 -c "import sys; sys.path.append('shell'); import utils; utils.print_with_time('safe_test; id')"
-
-# 验证 get_date_time 容错
-python3 -c "import sys; sys.path.append('shell'); import utils; print(utils.get_date_time(None)); print(utils.get_date_time(1729000000000))"
-```
+单元测试与静态检查由 GitHub Actions 在每次 push 与 pull request 时自动执行，
+流水线定义见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，包含 gofmt/vet
+校验、`go test -race -cover` 与 `golangci-lint run`。**本地验证通过不等于 CI 通过**，
+合并前必须以 CI 绿色为准。
 
 ---
 

@@ -2,6 +2,5 @@
 .github
 *.md
 docs/
-shell/
 push-transfer
 .dockerignore
