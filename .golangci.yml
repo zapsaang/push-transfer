@@ -1,0 +1,41 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - revive
+    - errorlint
+    - gocritic
+    - misspell
+    - unconvert
+    - nilerr
+  settings:
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: unused-parameter
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        - whyNoLint
+        - hugeParam
+
+formatters:
+  enable:
+    - gofmt
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
