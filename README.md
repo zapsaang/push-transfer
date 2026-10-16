@@ -27,8 +27,9 @@
   - [Bark 端到端加密配置](#bark-端到端加密配置)
 - [客户端接入指南](#客户端接入指南)
   - [1. Webhook 接口规范](#1-webhook-接口规范)
-  - [2. 短信转发器 (SmsForwarder) 接入示例](#2-短信转发器-smsforwarder-接入示例)
-  - [3. IMAP 邮件触发接入](#3-imap-邮件触发接入)
+  - [2. 多凭据接入配置 (AUTH_CREDENTIALS)](#2-多凭据接入配置-auth_credentials)
+  - [3. 短信转发器 (SmsForwarder) 接入示例](#3-短信转发器-smsforwarder-接入示例)
+  - [4. IMAP 邮件触发接入](#4-imap-邮件触发接入)
 - [运维与验证](#运维与验证)
 - [开发与测试](#开发与测试)
 
@@ -77,7 +78,7 @@ flowchart TD
   - **SMTP 邮件**：支持 SSL/TLS 直连、RFC 2047 标题编码清洗与 CRLF 注入防护。
   - **Console 回显**：无外部分发目标时自动回退为控制台输出，便于本地调试。
 - **防御性安全设计**：
-  - **双鉴权与恒定时间比对**：支持 Bearer Token 与 HTTP Basic Auth，凭据比对采用 `crypto/subtle.ConstantTimeCompare`，杜绝时序攻击（Timing Attack）。
+  - **多凭据恒定时间比对**：每台设备可持有独立的 Bearer Token 或 HTTP Basic 凭据，凭据比对采用 `crypto/subtle.ConstantTimeCompare` 并对全部凭据做无短路全量扫描，杜绝时序攻击（Timing Attack）。
   - **受信代理与真实 IP 提取**：默认仅信任回环与私网反向代理，支持自定义 `TRUSTED_PROXIES`，防止客户端伪造 `X-Forwarded-For`。
   - **DoS 与 OOM 防御**：Webhook 限制请求体最大 1MB，防止大报文内存耗尽；正则引擎对每次匹配施加 500ms 超时熔断（`regexp2` 回溯超时），遇到 ReDoS 型恶意输入时返回错误而非拖垮进程。
 - **高可靠 IMAP 邮件触发**：
@@ -136,7 +137,7 @@ time=2026-10-16T20:53:36.606+08:00 level=INFO msg="console deliver" msg_type=tex
 复制模板生成 `.env` 配置文件：
 ```bash
 cp .env.example .env
-# 按需修改 .env 中的配置项（如 BARK_DEVICE_KEY_LIST、AUTH_TOKEN 等）
+# 按需修改 .env 中的配置项（如 BARK_DEVICE_KEY_LIST、AUTH_CREDENTIALS 等）
 vim .env
 ```
 
@@ -204,7 +205,7 @@ CGO_ENABLED=0 go build -ldflags="-s -w" -o push-transfer ./cmd/push-transfer
 
 # 指定环境变量或导出 .env 后运行
 export PORT=8889
-export AUTH_TOKEN="your_secure_token"
+export AUTH_CREDENTIALS='[{"name":"phone-a","token":"your_secure_token"}]'
 export BARK_DEVICE_KEY_LIST="your_bark_device_key"
 
 ./push-transfer
@@ -278,14 +279,12 @@ PushTransfer 遵循 **12-Factor 原则**，所有配置均通过环境变量进�
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `PORT` | `8889` | HTTP Webhook 服务监听端口（兼容别名 `SERVER_PORT`） |
-| `RUN_TRIGGER` | `false` | 是否开启 IMAP 邮件触发器后台监听（`true` 或 `1` 启用）。开启后若未配置任何 Webhook 鉴权（`AUTH_TOKEN` 或 `AUTH_USERNAME`+`AUTH_PASSWORD`），HTTP 端口**不会**启动以避免暴露无鉴权入口，启动时会打印 `WARN` 说明 |
+| `RUN_TRIGGER` | `false` | 是否开启 IMAP 邮件触发器后台监听（`true` 或 `1` 启用）。Webhook **绝不以无鉴权方式提供服务**：未配置 `AUTH_CREDENTIALS` 且 `RUN_TRIGGER` 不为 `true` 时进程启动即报错退出；只有 `RUN_TRIGGER=true`（纯 IMAP 模式，不监听 HTTP）才允许无凭据运行 |
 
 #### 2. Webhook 接入鉴权与网络代理
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
-| `AUTH_TOKEN` | _(空)_ | Webhook Bearer Token。配置后请求需携带 `Authorization: Bearer <TOKEN>` 或 `?token=<TOKEN>`（查询参数仅为兼容旧版 Python 客户端，令牌可能被上游访问日志记录，生产环境建议优先使用请求头） |
-| `AUTH_USERNAME` | _(空)_ | HTTP Basic Auth 用户名（必须与 `AUTH_PASSWORD` 成对配置）。鉴权失败时响应 `401` 并附带 `WWW-Authenticate: Basic` 质询 |
-| `AUTH_PASSWORD` | _(空)_ | HTTP Basic Auth 密码 |
+| `AUTH_CREDENTIALS` | _(空)_ | **唯一**凭据来源：单行严格 JSON 数组，每项支持 `name`（审计标识）、`token`、`username`、`password`。同一 token 或同一组 username+password 只能出现一次，重复即启动报错。未配置且 `RUN_TRIGGER` 不为 `true` 时启动失败。详见[多凭据接入配置](#2-多凭据接入配置-auth_credentials) |
 | `TRUSTED_PROXIES` | _(空)_ | 信任的反向代理 IP 或 CIDR 列表（逗号分隔，如 `10.0.0.0/8,192.168.1.1`，兼容别名 `WEBHOOK_TRUSTED_PROXIES`）。默认已自动信任 Loopback 与 RFC 1918 私网地址。仅当直连对端属于受信代理时才解析 `X-Forwarded-For`/`X-Real-IP`，并从右向左跳过受信代理取第一个非受信地址，避免客户端伪造 |
 
 #### 3. Bark 投递通道
@@ -379,7 +378,7 @@ PushTransfer 实现了 Bark 官方兼容的 AES 加密推送机制：
 #### 请求头 (Headers)
 ```http
 Content-Type: application/json
-Authorization: Bearer <AUTH_TOKEN>   # 若配置了 AUTH_TOKEN
+Authorization: Bearer <你的 token>   # AUTH_CREDENTIALS 中某个条目的 token
 # 或使用 HTTP Basic Auth: Authorization: Basic <base64(user:pass)>
 ```
 
@@ -416,7 +415,7 @@ Authorization: Bearer <AUTH_TOKEN>   # 若配置了 AUTH_TOKEN
 | `200 OK` | `{"status":"success"}` | 消息处理并通过流水线，已成功投递下游 |
 | `200 OK` | `{"status":"blocked"}` | 消息命中黑名单规则，已被网关正常拦截过滤 |
 | `400 Bad Request` | `{"status":"failed","message":"invalid json"}` | 报文不是合法的 JSON 格式 |
-| `401 Unauthorized`| `{"status":"failed","message":"unauthorized"}` | Bearer Token / Query Token / Basic Auth 认证失败（配置 Basic Auth 时附带 `WWW-Authenticate: Basic` 质询） |
+| `401 Unauthorized`| `{"status":"failed","message":"unauthorized"}` | Bearer Token / Query Token / Basic Auth 认证失败（配置 Basic Auth 时附带 `WWW-Authenticate: Basic` 质询；多凭据下响应不区分具体失败凭据以避免枚举） |
 | `405 Method Not Allowed` | `{"status":"failed","message":"method not allowed"}` | 请求方法不为 `POST` |
 | `413 Request Entity Too Large` | `{"status":"failed","message":"request body too large"}` | 请求体体积超过 1MB 上限 |
 | `500 Internal Server Error` | `{"status":"failed","message":"process failed"}` | 规则流水线执行失败（如正则匹配超时熔断） |
@@ -424,7 +423,36 @@ Authorization: Bearer <AUTH_TOKEN>   # 若配置了 AUTH_TOKEN
 
 ---
 
-### 2. 短信转发器 (SmsForwarder) 接入示例
+### 2. 多凭据接入配置 (AUTH_CREDENTIALS)
+
+针对拥有多台上报设备（如多台 Android 短信转发器、多台测试终端或自动化脚本）的场景，使用 `AUTH_CREDENTIALS` 环境变量以**单行 JSON 数组**配置多组独立凭据。它是**唯一**的 Webhook 凭据来源：
+
+```bash
+AUTH_CREDENTIALS='[{"name":"phone-a","token":"random-token-1"},{"name":"tablet","username":"tab-user","password":"tab-password"},{"name":"phone-b","token":"random-token-2","username":"backup-user","password":"backup-password"}]'
+```
+
+- **配置契约与字段**：
+  - `name`：可选的审计标识，进入结构化审计日志以区分来源设备（如 `level=INFO msg="webhook authorized" ip=... credential=phone-a`）。切勿在 `name` 中包含密码或敏感信息。若缺省则自动命名为 `credential-N`（1-based 序号）；`name` 最大 64 字符且**禁止以保留前缀 `env:` 开头**。
+  - `token`：Bearer Token / 查询参数 Token（可选，与 Basic Auth 至少提供一项）。
+  - `username` 与 `password`：HTTP Basic Auth 凭据对，必须成对配置（若仅配置其中一项将报启动错误）。
+  - 每个认证要素必须是**唯一**的：同一个 `token`，或同一组 `username`+`password`，在数组里只能出现一次；重复会在启动时报错，因为一个密钥只能对应一个审计身份，静默去重会让日志出现二义性。
+- **校验硬约束（Fail-Fast）**：
+  - JSON 必须严格格式化，不支持未知字段或尾随字符；
+  - 数组不得为空或 `null`（配置了变量就必须至少包含一条有效凭据）；
+  - 单次最多支持配置 64 条凭据；
+  - 环境变量必须写在**单行**内，避免被容器或 shell 分行注入截断；
+  - 启动校验失败时报错信息只包含变量名、条目序号与出错字段，**绝不回显凭据内容**（避免密钥进入日志）。
+- **无隐式开放入口**：
+  - 进程若需要对外提供 Webhook（即 `RUN_TRIGGER` 不为 `true`），就必须配置 `AUTH_CREDENTIALS`，否则**启动即失败退出**，不会以无鉴权方式监听端口。
+  - 唯一允许无凭据运行的模式是纯 IMAP 模式：`RUN_TRIGGER=true`（不监听 HTTP）。
+  - 旧版的 `AUTH_TOKEN` / `AUTH_USERNAME` / `AUTH_PASSWORD` 已**移除**，不再被读取；请把它们迁移成 `AUTH_CREDENTIALS` 中的一个条目，例如 `[{"name":"legacy","token":"<原 AUTH_TOKEN 值>"}]`。
+  - 建议为每台设备颁发独立 Token，便于凭据轮换与日志来源审计。
+- **恒定时间安全保障**：
+  - 无论配置多少组凭据，鉴权引擎均以 SHA-256 预计算摘要并在请求到达时进行全量扫描比对（无提前 return 短路），杜绝时序攻击（Timing Attack）。
+
+---
+
+### 3. 短信转发器 (SmsForwarder) 接入示例
 
 以 Android 端常用工具 **[SmsForwarder (短信转发器)](https://github.com/pppscn/SmsForwarder)** 为例：
 
@@ -462,7 +490,7 @@ Authorization: Bearer <AUTH_TOKEN>   # 若配置了 AUTH_TOKEN
 
 ---
 
-### 3. IMAP 邮件触发接入
+### 4. IMAP 邮件触发接入
 
 当部署环境无法暴露公网端口接收 Webhook 时，可通过邮件触发模式拉取消息：
 

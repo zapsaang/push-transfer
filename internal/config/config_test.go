@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -8,7 +9,7 @@ import (
 func TestConfig_OptionalChannels(t *testing.T) {
 	// Empty lookup simulation (no channel env vars set)
 	envMap := map[string]string{
-		"AUTH_TOKEN": "my-secret-token",
+		"AUTH_CREDENTIALS": `[{"name":"probe","token":"my-secret-token"}]`,
 	}
 	lookup := func(k string) string {
 		return envMap[k]
@@ -39,8 +40,8 @@ func TestConfig_OptionalChannels(t *testing.T) {
 	if cfg.Server.Port != 8889 {
 		t.Errorf("expected default port 8889, got %d", cfg.Server.Port)
 	}
-	if cfg.Auth.Token != "my-secret-token" {
-		t.Errorf("expected Auth.Token 'my-secret-token', got %q", cfg.Auth.Token)
+	if len(cfg.Auth.Credentials) != 1 || cfg.Auth.Credentials[0].Token != "my-secret-token" {
+		t.Errorf("expected one credential with token 'my-secret-token', got %+v", cfg.Auth.Credentials)
 	}
 	if cfg.RunTrigger {
 		t.Errorf("expected RunTrigger to be false by default, got true")
@@ -80,9 +81,7 @@ func TestConfig_RunTrigger(t *testing.T) {
 
 func TestConfig_EnabledChannels(t *testing.T) {
 	envMap := map[string]string{
-		"AUTH_USERNAME":                "admin",
-		"AUTH_PASSWORD":                "password123",
-		"AUTH_TOKEN":                   "token123",
+		"AUTH_CREDENTIALS":             `[{"name":"admin","username":"admin","password":"password123"}]`,
 		"TELEGRAM_BOT_TOKEN":           "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
 		"TELEGRAM_CHAT_ID":             "-1001234567890",
 		"TELEGRAM_API_URL":             "https://tg-proxy.example.com",
@@ -334,56 +333,460 @@ func TestConfig_Validation(t *testing.T) {
 	})
 }
 
-func TestConfig_AuthHelpers(t *testing.T) {
+func TestConfig_HasWebhookAuth(t *testing.T) {
 	t.Run("empty auth", func(t *testing.T) {
-		a := AuthConfig{}
-		if a.HasTokenAuth() || a.HasBasicAuth() || a.HasPartialBasicAuth() || a.HasWebhookAuth() {
-			t.Fatalf("expected all auth helpers to be false for empty AuthConfig")
+		if (AuthConfig{}).HasWebhookAuth() {
+			t.Fatal("expected HasWebhookAuth to be false for empty AuthConfig")
 		}
 	})
 
-	t.Run("token auth only", func(t *testing.T) {
-		a := AuthConfig{Token: "  secret-token  "}
-		if !a.HasTokenAuth() {
-			t.Fatal("expected HasTokenAuth to be true")
+	t.Run("nil credentials", func(t *testing.T) {
+		if (AuthConfig{Credentials: nil}).HasWebhookAuth() {
+			t.Fatal("expected HasWebhookAuth to be false for nil credentials")
 		}
-		if a.HasBasicAuth() || a.HasPartialBasicAuth() {
-			t.Fatal("expected BasicAuth helpers to be false")
+	})
+
+	t.Run("empty credentials slice", func(t *testing.T) {
+		if (AuthConfig{Credentials: []Credential{}}).HasWebhookAuth() {
+			t.Fatal("expected HasWebhookAuth to be false for an empty credentials slice")
 		}
+	})
+
+	t.Run("token credential", func(t *testing.T) {
+		a := AuthConfig{Credentials: []Credential{{Name: "c1", Token: "tok1"}}}
 		if !a.HasWebhookAuth() {
-			t.Fatal("expected HasWebhookAuth to be true")
+			t.Fatal("expected HasWebhookAuth to be true for a token credential")
 		}
 	})
 
-	t.Run("basic auth full", func(t *testing.T) {
-		a := AuthConfig{Username: "admin", Password: "secret"}
-		if a.HasTokenAuth() || a.HasPartialBasicAuth() {
-			t.Fatal("expected HasTokenAuth and HasPartialBasicAuth to be false")
-		}
-		if !a.HasBasicAuth() || !a.HasWebhookAuth() {
-			t.Fatal("expected HasBasicAuth and HasWebhookAuth to be true")
+	t.Run("basic credential", func(t *testing.T) {
+		a := AuthConfig{Credentials: []Credential{{Name: "c1", Username: "user", Password: "pass"}}}
+		if !a.HasWebhookAuth() {
+			t.Fatal("expected HasWebhookAuth to be true for a basic credential")
 		}
 	})
 
-	t.Run("partial basic auth - username only", func(t *testing.T) {
-		a := AuthConfig{Username: "admin", Password: "   "}
-		if a.HasBasicAuth() || a.HasWebhookAuth() {
-			t.Fatal("expected HasBasicAuth and HasWebhookAuth to be false")
+	t.Run("dual credential", func(t *testing.T) {
+		a := AuthConfig{Credentials: []Credential{{Name: "c1", Token: "tok1", Username: "user", Password: "pass"}}}
+		if !a.HasWebhookAuth() {
+			t.Fatal("expected HasWebhookAuth to be true for a dual credential")
 		}
-		if !a.HasPartialBasicAuth() {
-			t.Fatal("expected HasPartialBasicAuth to be true when only Username is set")
+	})
+}
+
+func TestConfig_AuthCredentialsParse(t *testing.T) {
+	t.Run("valid multi-entry with defaults and whitespace trimming", func(t *testing.T) {
+		input := `[
+			{"name":"phone-a","token":"  tok-a  "},
+			{"token":"tok-b"},
+			{"name":"custom-basic","username":"  usr-c  ","password":"  pwd-c  "}
+		]`
+		envMap := map[string]string{
+			"AUTH_CREDENTIALS": input,
+		}
+		cfg, err := LoadFromLookup(func(k string) string { return envMap[k] })
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.Auth.Credentials) != 3 {
+			t.Fatalf("expected 3 credentials, got %d", len(cfg.Auth.Credentials))
+		}
+
+		expected := []Credential{
+			{Name: "phone-a", Token: "tok-a"},
+			{Name: "credential-2", Token: "tok-b"},
+			{Name: "custom-basic", Username: "usr-c", Password: "pwd-c"},
+		}
+		for i, exp := range expected {
+			got := cfg.Auth.Credentials[i]
+			if got != exp {
+				t.Errorf("[%d] expected %+v, got %+v", i, exp, got)
+			}
 		}
 	})
 
-	t.Run("partial basic auth - password only", func(t *testing.T) {
-		a := AuthConfig{Username: "", Password: "secret"}
-		if a.HasBasicAuth() || a.HasWebhookAuth() {
-			t.Fatal("expected HasBasicAuth and HasWebhookAuth to be false")
-		}
-		if !a.HasPartialBasicAuth() {
-			t.Fatal("expected HasPartialBasicAuth to be true when only Password is set")
+	t.Run("blank AUTH_CREDENTIALS results in empty credentials and nil err", func(t *testing.T) {
+		for _, raw := range []string{"", "   ", "\t\n"} {
+			envMap := map[string]string{
+				"AUTH_CREDENTIALS": raw,
+			}
+			cfg, err := LoadFromLookup(func(k string) string { return envMap[k] })
+			if err != nil {
+				t.Fatalf("raw %q: unexpected error: %v", raw, err)
+			}
+			if len(cfg.Auth.Credentials) != 0 {
+				t.Fatalf("raw %q: expected empty credentials, got %v", raw, cfg.Auth.Credentials)
+			}
 		}
 	})
+
+	t.Run("single element without name gets default name credential-1", func(t *testing.T) {
+		envMap := map[string]string{
+			"AUTH_CREDENTIALS": `[{"token":"single-token"}]`,
+		}
+		cfg, err := LoadFromLookup(func(k string) string { return envMap[k] })
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.Auth.Credentials) != 1 {
+			t.Fatalf("expected 1 credential, got %d", len(cfg.Auth.Credentials))
+		}
+		expected := Credential{Name: "credential-1", Token: "single-token"}
+		if cfg.Auth.Credentials[0] != expected {
+			t.Fatalf("expected %+v, got %+v", expected, cfg.Auth.Credentials[0])
+		}
+	})
+}
+
+func TestConfig_AuthCredentialsValidation(t *testing.T) {
+	cases := []struct {
+		name        string
+		input       string
+		errContains string
+	}{
+		// V2: Malformed JSON / Element not object / Trailing garbage / Unknown field
+		{
+			name:        "V2_malformed_json",
+			input:       `{not-valid-json`,
+			errContains: "must be a JSON array of credential objects",
+		},
+		{
+			name:        "V2_element_not_object",
+			input:       `["string-not-object"]`,
+			errContains: "must be a JSON array of credential objects",
+		},
+		{
+			name:        "V2_unknown_field_spelling",
+			input:       `[{"tokens":"secret"}]`,
+			errContains: "unknown field \"tokens\"",
+		},
+		{
+			name:        "V2_trailing_garbage",
+			input:       `[{"token":"secret"}] trailing_data`,
+			errContains: "trailing data",
+		},
+
+		// V3: Empty array or null
+		{
+			name:        "V3_empty_array",
+			input:       `[]`,
+			errContains: "must contain at least one credential",
+		},
+		{
+			name:        "V3_null",
+			input:       `null`,
+			errContains: "must contain at least one credential",
+		},
+
+		// V4: Entry has no material
+		{
+			name:        "V4_no_material",
+			input:       `[{"name":"only-name"}]`,
+			errContains: "entry 1 must set either \"token\" or both \"username\" and \"password\"",
+		},
+		{
+			name:        "V4_second_entry_no_material",
+			input:       `[{"token":"tok1"}, {"name":"second-only-name"}]`,
+			errContains: "entry 2 must set either \"token\" or both \"username\" and \"password\"",
+		},
+
+		// V5: Keys present but empty or blank
+		{
+			name:        "V5_token_blank",
+			input:       `[{"token":"   "}]`,
+			errContains: "entry 1: \"token\" must not be blank",
+		},
+		{
+			name:        "V5_name_blank",
+			input:       `[{"name":"   ","token":"my-token"}]`,
+			errContains: "entry 1: \"name\" must not be blank",
+		},
+		{
+			name:        "V5_username_blank",
+			input:       `[{"username":"   ","password":"p"}]`,
+			errContains: "entry 1: \"username\" must not be blank",
+		},
+		{
+			name:        "V5_password_blank",
+			input:       `[{"username":"u","password":"   "}]`,
+			errContains: "entry 1: \"password\" must not be blank",
+		},
+
+		// V6: Basic auth one-sided
+		{
+			name:        "V6_username_only",
+			input:       `[{"username":"u"}]`,
+			errContains: "entry 1: \"username\" and \"password\" must be provided together",
+		},
+		{
+			name:        "V6_password_only",
+			input:       `[{"password":"p"}]`,
+			errContains: "entry 1: \"username\" and \"password\" must be provided together",
+		},
+
+		// V7: Duplicate name (explicit and generated)
+		{
+			name:        "V7_duplicate_explicit_name",
+			input:       `[{"name":"phone","token":"tok1"},{"name":"phone","token":"tok2"}]`,
+			errContains: "entry 2: duplicate credential name \"phone\"",
+		},
+		{
+			name:        "V7_duplicate_generated_name_collision",
+			input:       `[{"token":"tok1"},{"name":"credential-1","token":"tok2"}]`,
+			errContains: "entry 2: duplicate credential name \"credential-1\"",
+		},
+
+		// V8: Name exceeds 64 characters
+		{
+			name:        "V8_name_exceeds_64_runes",
+			input:       `[{"name":"` + strings.Repeat("a", 65) + `","token":"tok1"}]`,
+			errContains: "entry 1: \"name\" must not exceed 64 characters",
+		},
+
+		// V9: Name starts with reserved prefix env:
+		{
+			name:        "V9_name_reserved_prefix",
+			input:       `[{"name":"env:custom","token":"tok1"}]`,
+			errContains: "entry 1: \"name\" must not start with reserved prefix \"env:\"",
+		},
+
+		// V10: More than 64 entries
+		{
+			name: "V10_exceeds_64_entries",
+			input: func() string {
+				var items []string
+				for i := 1; i <= 65; i++ {
+					items = append(items, fmt.Sprintf(`{"token":"tok-%d"}`, i))
+				}
+				return "[" + strings.Join(items, ",") + "]"
+			}(),
+			errContains: "must not contain more than 64 credentials",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			envMap := map[string]string{
+				"AUTH_CREDENTIALS": tc.input,
+			}
+			cfg, err := LoadFromLookup(func(k string) string { return envMap[k] })
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil error and cfg=%+v", tc.errContains, cfg)
+			}
+			if !strings.Contains(err.Error(), tc.errContains) {
+				t.Errorf("expected error containing %q, got %q", tc.errContains, err.Error())
+			}
+		})
+	}
+}
+
+// TestConfig_AuthCredentialsErrorNeverLeaksSecretMaterial is a permanent negative regression
+// guard: AUTH_CREDENTIALS holds plaintext tokens/passwords, and the startup failure path
+// (config error -> slog.Error in main) must never echo the raw value.
+func TestConfig_AuthCredentialsErrorNeverLeaksSecretMaterial(t *testing.T) {
+	const secret = "s3cr3t-token-value"
+
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"trailing garbage", `[{"token":"` + secret + `"}] oops`},
+		{"malformed json", `{"token":"` + secret + `"`},
+		{"truncated array", `[{"token":"` + secret + `"},`},
+		{"unknown field", `[{"tokn":"` + secret + `"}]`},
+		{"secret in password", `[{"username":"u","password":"` + secret + `"}] trailing`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseCredentials(tc.input)
+			if err == nil {
+				t.Fatalf("expected an error for input %q", tc.input)
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("error message leaks credential material: %v", err)
+			}
+		})
+	}
+}
+
+// TestConfig_AuthCredentialsBoundaries locks the inclusive/exclusive edges of V7-V10 and the
+// JSON decoding contracts (case-insensitive keys, explicit null == absent).
+func TestConfig_AuthCredentialsBoundaries(t *testing.T) {
+	t.Run("exactly 64 entries is accepted", func(t *testing.T) {
+		items := make([]string, 0, 64)
+		for i := 1; i <= 64; i++ {
+			items = append(items, fmt.Sprintf(`{"token":"tok-%d"}`, i))
+		}
+		cfg, err := LoadFromLookup(func(k string) string {
+			if k == "AUTH_CREDENTIALS" {
+				return "[" + strings.Join(items, ",") + "]"
+			}
+			return ""
+		})
+		if err != nil {
+			t.Fatalf("expected 64 entries to be accepted, got: %v", err)
+		}
+		if len(cfg.Auth.Credentials) != 64 {
+			t.Fatalf("expected 64 credentials, got %d", len(cfg.Auth.Credentials))
+		}
+	})
+
+	t.Run("name of exactly 64 runes is accepted", func(t *testing.T) {
+		name := strings.Repeat("é", 64) // multi-byte runes: byte length is 128
+		cfg, err := LoadFromLookup(func(k string) string {
+			if k == "AUTH_CREDENTIALS" {
+				return `[{"name":"` + name + `","token":"tok"}]`
+			}
+			return ""
+		})
+		if err != nil {
+			t.Fatalf("expected 64-rune name to be accepted, got: %v", err)
+		}
+		if cfg.Auth.Credentials[0].Name != name {
+			t.Fatalf("expected name %q, got %q", name, cfg.Auth.Credentials[0].Name)
+		}
+	})
+
+	t.Run("reserved prefix only rejected at the start of the name", func(t *testing.T) {
+		cfg, err := LoadFromLookup(func(k string) string {
+			if k == "AUTH_CREDENTIALS" {
+				return `[{"name":"myenv:device","token":"tok"}]`
+			}
+			return ""
+		})
+		if err != nil {
+			t.Fatalf("expected 'myenv:device' to be accepted, got: %v", err)
+		}
+		if cfg.Auth.Credentials[0].Name != "myenv:device" {
+			t.Fatalf("unexpected name: %q", cfg.Auth.Credentials[0].Name)
+		}
+	})
+
+	t.Run("json field names are matched case-insensitively", func(t *testing.T) {
+		cfg, err := LoadFromLookup(func(k string) string {
+			if k == "AUTH_CREDENTIALS" {
+				return `[{"NAME":"upper","TOKEN":"tok"}]`
+			}
+			return ""
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		expected := Credential{Name: "upper", Token: "tok"}
+		if cfg.Auth.Credentials[0] != expected {
+			t.Fatalf("expected %+v, got %+v", expected, cfg.Auth.Credentials[0])
+		}
+	})
+
+	t.Run("explicit null token is treated as absent", func(t *testing.T) {
+		_, err := parseCredentials(`[{"token":null}]`)
+		if err == nil {
+			t.Fatal("expected V4 error when token is null and no basic pair is present")
+		}
+		if !strings.Contains(err.Error(), `entry 1 must set either "token" or both "username" and "password"`) {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("explicit null token with a full basic pair is accepted", func(t *testing.T) {
+		cfg, err := LoadFromLookup(func(k string) string {
+			if k == "AUTH_CREDENTIALS" {
+				return `[{"token":null,"username":"u","password":"p"}]`
+			}
+			return ""
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		expected := Credential{Name: "credential-1", Username: "u", Password: "p"}
+		if cfg.Auth.Credentials[0] != expected {
+			t.Fatalf("expected %+v, got %+v", expected, cfg.Auth.Credentials[0])
+		}
+	})
+}
+
+// TestConfig_AuthCredentialsRejectsDuplicateFactors pins the strict-validation replacement for
+// the removed legacy/union dedup: with a single credential source there is no reason to accept
+// two entries that declare the same authentication factor, because only one of them can ever be
+// the audit identity of a matching request. Rejecting at startup is fail-fast and unambiguous.
+func TestConfig_AuthCredentialsRejectsDuplicateFactors(t *testing.T) {
+	cases := []struct {
+		name        string
+		input       string
+		errContains string
+	}{
+		{
+			name:        "duplicate token across two entries",
+			input:       `[{"name":"a","token":"shared-token"},{"name":"b","token":"shared-token"}]`,
+			errContains: `entry 2: duplicate "token" already used by entry 1`,
+		},
+		{
+			name:        "duplicate basic pair across two entries",
+			input:       `[{"name":"a","username":"u","password":"p"},{"name":"b","username":"u","password":"p"}]`,
+			errContains: `entry 2: duplicate "username"/"password" pair already used by entry 1`,
+		},
+		{
+			name:        "duplicate token between a token-only and a dual entry",
+			input:       `[{"name":"a","token":"t"},{"name":"b","token":"t","username":"u","password":"p"}]`,
+			errContains: `entry 2: duplicate "token" already used by entry 1`,
+		},
+		{
+			name:        "duplicate basic pair between a basic-only and a dual entry",
+			input:       `[{"name":"a","username":"u","password":"p"},{"name":"b","token":"t","username":"u","password":"p"}]`,
+			errContains: `entry 2: duplicate "username"/"password" pair already used by entry 1`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseCredentials(tc.input)
+			if err == nil {
+				t.Fatalf("expected an error for %s", tc.input)
+			}
+			if !strings.Contains(err.Error(), tc.errContains) {
+				t.Errorf("expected error containing %q, got %q", tc.errContains, err.Error())
+			}
+		})
+	}
+}
+
+// TestConfig_AuthCredentialsAllowsDistinctFactors is the negative half of the rule above: only an
+// identical factor is rejected, and the error must not fire for merely similar credentials.
+func TestConfig_AuthCredentialsAllowsDistinctFactors(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "same username with a different password",
+			input: `[{"name":"a","username":"u","password":"p1"},{"name":"b","username":"u","password":"p2"}]`,
+		},
+		{
+			name:  "same password with a different username",
+			input: `[{"name":"a","username":"u1","password":"p"},{"name":"b","username":"u2","password":"p"}]`,
+		},
+		{
+			name:  "different tokens",
+			input: `[{"name":"a","token":"t1"},{"name":"b","token":"t2"}]`,
+		},
+		{
+			name:  "token that equals another entry's username",
+			input: `[{"name":"a","token":"same-value"},{"name":"b","username":"same-value","password":"p"}]`,
+		},
+		{
+			name:  "token and basic pair on the same entry",
+			input: `[{"name":"a","token":"t","username":"u","password":"p"}]`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseCredentials(tc.input); err != nil {
+				t.Fatalf("expected no error for %s, got: %v", tc.input, err)
+			}
+		})
+	}
 }
 
 func TestConfig_BarkGetURLFallbackToPostURL(t *testing.T) {
@@ -502,9 +905,9 @@ func TestConfig_WhitespaceHandling(t *testing.T) {
 		}
 	})
 
-	t.Run("padded TELEGRAM_CHAT_ID and AUTH_TOKEN are trimmed cleanly", func(t *testing.T) {
+	t.Run("padded TELEGRAM_CHAT_ID and AUTH_CREDENTIALS are trimmed cleanly", func(t *testing.T) {
 		envMap := map[string]string{
-			"AUTH_TOKEN":         "  my-token-123 \n",
+			"AUTH_CREDENTIALS":   `  [ {"name":"  padded  ","token":"  my-token-123 "} ]  `,
 			"TELEGRAM_BOT_TOKEN": " 123:abc ",
 			"TELEGRAM_CHAT_ID":   " -100987654 ",
 		}
@@ -512,8 +915,12 @@ func TestConfig_WhitespaceHandling(t *testing.T) {
 		if err != nil {
 			t.Fatalf("expected padded TELEGRAM_CHAT_ID to parse, got error: %v", err)
 		}
-		if cfg.Auth.Token != "my-token-123" {
-			t.Errorf("expected trimmed Auth.Token 'my-token-123', got %q", cfg.Auth.Token)
+		if len(cfg.Auth.Credentials) != 1 {
+			t.Fatalf("expected 1 credential, got %+v", cfg.Auth.Credentials)
+		}
+		expected := Credential{Name: "padded", Token: "my-token-123"}
+		if cfg.Auth.Credentials[0] != expected {
+			t.Errorf("expected trimmed credential %+v, got %+v", expected, cfg.Auth.Credentials[0])
 		}
 		if cfg.Telegram == nil || cfg.Telegram.ChatID != -100987654 || cfg.Telegram.BotToken != "123:abc" {
 			t.Errorf("unexpected Telegram config: %+v", cfg.Telegram)
@@ -661,35 +1068,26 @@ func TestConfig_PartialChannelHelpers(t *testing.T) {
 		}
 	})
 
-	t.Run("AuthConfig helpers with whitespace edge cases", func(t *testing.T) {
-		emptyAuth := AuthConfig{}
-		if emptyAuth.HasTokenAuth() || emptyAuth.HasBasicAuth() || emptyAuth.HasPartialBasicAuth() || emptyAuth.HasWebhookAuth() {
-			t.Fatal("expected all auth methods to report false for empty AuthConfig")
+	t.Run("AuthConfig HasWebhookAuth edge cases", func(t *testing.T) {
+		if (AuthConfig{}).HasWebhookAuth() {
+			t.Fatal("expected HasWebhookAuth=false for empty AuthConfig")
 		}
 
-		wsAuth := AuthConfig{Username: "  ", Password: "   ", Token: "\t "}
-		if wsAuth.HasTokenAuth() || wsAuth.HasBasicAuth() || wsAuth.HasPartialBasicAuth() || wsAuth.HasWebhookAuth() {
-			t.Fatal("expected all auth methods to report false for whitespace-only AuthConfig")
+		// Whitespace-only material never survives parseCredentials, but the predicate must not
+		// be fooled by a hand-built AuthConfig either: it counts entries, not raw characters.
+		wsAuth := AuthConfig{Credentials: []Credential{{Name: "ws", Token: "  "}}}
+		if !wsAuth.HasWebhookAuth() {
+			t.Fatal("expected HasWebhookAuth to count the entry; parseCredentials is what rejects blanks")
 		}
 
-		partialUser := AuthConfig{Username: "admin", Password: "  "}
-		if !partialUser.HasPartialBasicAuth() || partialUser.HasBasicAuth() {
-			t.Fatal("expected HasPartialBasicAuth=true when password is only whitespace")
+		fullBasic := AuthConfig{Credentials: []Credential{{Name: "basic", Username: "admin", Password: "secret"}}}
+		if !fullBasic.HasWebhookAuth() {
+			t.Fatal("expected complete Basic credential to count")
 		}
 
-		partialPass := AuthConfig{Username: "  ", Password: "secret"}
-		if !partialPass.HasPartialBasicAuth() || partialPass.HasBasicAuth() {
-			t.Fatal("expected HasPartialBasicAuth=true when username is only whitespace")
-		}
-
-		fullBasic := AuthConfig{Username: "admin", Password: "secret"}
-		if fullBasic.HasPartialBasicAuth() || !fullBasic.HasBasicAuth() || !fullBasic.HasWebhookAuth() {
-			t.Fatal("expected complete Basic Auth")
-		}
-
-		tokenAuth := AuthConfig{Token: "my-token"}
-		if !tokenAuth.HasTokenAuth() || !tokenAuth.HasWebhookAuth() {
-			t.Fatal("expected complete Token Auth")
+		tokenAuth := AuthConfig{Credentials: []Credential{{Name: "tok", Token: "my-token"}}}
+		if !tokenAuth.HasWebhookAuth() {
+			t.Fatal("expected complete Token credential to count")
 		}
 	})
 }

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/zapsaang/push-transfer/internal/config"
 	"github.com/zapsaang/push-transfer/internal/model"
 )
 
@@ -28,9 +29,7 @@ const DefaultMaxBodyBytes int64 = 1 << 20
 
 // HandlerOptions configures the Webhook Handler.
 type HandlerOptions struct {
-	Token          string
-	Username       string
-	Password       string
+	Credentials    []config.Credential
 	MaxBodyBytes   int64
 	TrustedProxies []string
 	Processor      Processor
@@ -40,9 +39,7 @@ type HandlerOptions struct {
 
 // Handler handles incoming Webhook HTTP requests.
 type Handler struct {
-	token          string
-	username       string
-	password       string
+	creds          *credentialSet
 	maxBodyBytes   int64
 	trustedProxies []*net.IPNet
 	processor      Processor
@@ -51,6 +48,11 @@ type Handler struct {
 }
 
 // NewHandler creates a new Webhook Handler.
+//
+// There is no open-access mode: a handler built without any usable credential rejects every
+// request. Serving the webhook unauthenticated is prevented at startup instead
+// (cmd/push-transfer fails fast), so an empty set here means the caller wired things up wrong
+// and the safe outcome is to deny.
 func NewHandler(opts HandlerOptions) *Handler {
 	logger := opts.Logger
 	if logger == nil {
@@ -60,10 +62,12 @@ func NewHandler(opts HandlerOptions) *Handler {
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = DefaultMaxBodyBytes
 	}
+	creds := newCredentialSet(opts.Credentials)
+	if creds.empty() {
+		logger.Warn("webhook handler built without any usable credential; all requests will be rejected (fail-closed)")
+	}
 	return &Handler{
-		token:          strings.TrimSpace(opts.Token),
-		username:       strings.TrimSpace(opts.Username),
-		password:       strings.TrimSpace(opts.Password),
+		creds:          creds,
 		maxBodyBytes:   maxBodyBytes,
 		trustedProxies: parseTrustedProxies(opts.TrustedProxies, logger),
 		processor:      opts.Processor,
@@ -199,33 +203,8 @@ func extractRealIP(r *http.Request, customNets []*net.IPNet) string {
 	return remoteHost
 }
 
-func (h *Handler) isAuthorized(r *http.Request) bool {
-	hasTokenAuth := h.token != ""
-	hasBasicAuth := h.username != "" && h.password != ""
-	if !hasTokenAuth && !hasBasicAuth {
-		return true
-	}
-
-	if hasTokenAuth {
-		if token := ExtractBearerToken(r); token != "" && SecureCompare(token, h.token) {
-			return true
-		}
-		if token := ExtractQueryToken(r); token != "" && SecureCompare(token, h.token) {
-			return true
-		}
-	}
-
-	if hasBasicAuth {
-		if user, pass, ok := r.BasicAuth(); ok {
-			userMatch := SecureCompare(user, h.username)
-			passMatch := SecureCompare(pass, h.password)
-			if userMatch && passMatch {
-				return true
-			}
-		}
-	}
-
-	return false
+func (h *Handler) isAuthorized(r *http.Request) (string, bool) {
+	return h.creds.verify(r)
 }
 
 // ServeHTTP implements http.Handler for the webhook endpoint.
@@ -242,13 +221,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Authentication (Bearer Token and/or HTTP Basic Auth)
-	if !h.isAuthorized(r) {
+	name, authorized := h.isAuthorized(r)
+	if !authorized {
 		h.logger.Warn("webhook auth failed", "ip", clientIP)
 		// RFC 9110 section 15.5.2 requires a 401 response for HTTP Basic Auth to carry a
 		// challenge, otherwise clients cannot prompt for credentials. Only advertise
 		// Basic when it is actually configured, so token-only deployments do not trigger
 		// spurious browser credential dialogs.
-		if h.username != "" && h.password != "" {
+		if h.creds != nil && h.creds.hasBasicAuth {
 			w.Header().Set("WWW-Authenticate", `Basic realm="push-transfer", charset="UTF-8"`)
 		}
 		writeJSON(w, http.StatusUnauthorized, map[string]string{
@@ -256,6 +236,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"message": "unauthorized",
 		})
 		return
+	}
+	if name != "" {
+		h.logger.Info("webhook authorized", "ip", clientIP, "credential", name)
 	}
 
 	// 2. Decode JSON body with size limit

@@ -62,6 +62,16 @@ func TestBuildDispatcher_ConsoleOnly(t *testing.T) {
 	}
 }
 
+// credentialEnv renders a single-token AUTH_CREDENTIALS value.
+func credentialEnv(name, token string) string {
+	return fmt.Sprintf(`[{"name":%q,"token":%q}]`, name, token)
+}
+
+// basicCredentialEnv renders a single Basic-pair AUTH_CREDENTIALS value.
+func basicCredentialEnv(name, user, pass string) string {
+	return fmt.Sprintf(`[{"name":%q,"username":%q,"password":%q}]`, name, user, pass)
+}
+
 func TestRun_VersionFlag(t *testing.T) {
 	t.Run("-version flag", func(t *testing.T) {
 		var buf bytes.Buffer
@@ -190,7 +200,7 @@ func TestRun_FullE2E_WebhookFlow(t *testing.T) {
 	const authToken = "secret-token-e2e-2026"
 	envMap := map[string]string{
 		"PORT":                 "0", // Assign ephemeral OS port
-		"AUTH_TOKEN":           authToken,
+		"AUTH_CREDENTIALS":     credentialEnv("e2e", authToken),
 		"BARK_DEVICE_KEY_LIST": "bark-test-device-key",
 		"BARK_POST_URL":        mockBark.URL + "/push",
 		"TELEGRAM_BOT_TOKEN":   "123456:ABC-DEF",
@@ -541,8 +551,8 @@ func TestRun_ConfigErrors(t *testing.T) {
 
 		_, portStr, _ := net.SplitHostPort(ln.Addr().String())
 		env := map[string]string{
-			"PORT":       portStr,
-			"AUTH_TOKEN": "token",
+			"PORT":             portStr,
+			"AUTH_CREDENTIALS": credentialEnv("probe", "token"),
 		}
 		err = run(context.Background(), nil, io.Discard, func(k string) string { return env[k] })
 		if err == nil {
@@ -550,13 +560,43 @@ func TestRun_ConfigErrors(t *testing.T) {
 		}
 	})
 
+	t.Run("invalid AUTH_CREDENTIALS configuration", func(t *testing.T) {
+		env := map[string]string{
+			"AUTH_CREDENTIALS": `[{"token":"   "}]`,
+		}
+		err := run(context.Background(), nil, io.Discard, func(k string) string { return env[k] })
+		if err == nil {
+			t.Fatal("expected error with invalid AUTH_CREDENTIALS, got nil")
+		}
+		if !strings.Contains(err.Error(), "AUTH_CREDENTIALS") {
+			t.Errorf("expected startup error to name the offending variable, got: %v", err)
+		}
+	})
+
+	t.Run("malformed AUTH_CREDENTIALS failure never echoes credential material", func(t *testing.T) {
+		const secret = "leaked-startup-secret"
+		env := map[string]string{
+			"AUTH_CREDENTIALS": `[{"token":"` + secret + `"}] trailing`,
+		}
+		err := run(context.Background(), nil, io.Discard, func(k string) string { return env[k] })
+		if err == nil {
+			t.Fatal("expected error with malformed AUTH_CREDENTIALS, got nil")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("startup error leaked credential material: %v", err)
+		}
+		if !strings.Contains(err.Error(), "AUTH_CREDENTIALS") {
+			t.Errorf("expected startup error to name the offending variable, got: %v", err)
+		}
+	})
+
 	t.Run("trigger enabled without IMAP configured", func(_ *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		env := map[string]string{
-			"RUN_TRIGGER": "true",
-			"AUTH_TOKEN":  "token",
-			"PORT":        "0",
+			"RUN_TRIGGER":      "true",
+			"AUTH_CREDENTIALS": credentialEnv("probe", "token"),
+			"PORT":             "0",
 		}
 		_ = run(ctx, nil, io.Discard, func(k string) string { return env[k] })
 	})
@@ -638,8 +678,8 @@ func TestRun_HTTPServerGoroutineTrackedInWaitGroup(t *testing.T) {
 	defer cancel()
 
 	env := map[string]string{
-		"PORT":       "0",
-		"AUTH_TOKEN": "waitgroup-token",
+		"PORT":             "0",
+		"AUTH_CREDENTIALS": credentialEnv("wg", "waitgroup-token"),
 	}
 	lookup := func(k string) string { return env[k] }
 
@@ -751,15 +791,14 @@ func TestBuildDispatcher_PartialConfigWarnings(t *testing.T) {
 		}
 	})
 
-	t.Run("run logs all partial config warnings including partial Basic Auth and partial IMAP", func(t *testing.T) {
+	t.Run("run logs all partial config warnings including partial IMAP", func(t *testing.T) {
 		var buf bytes.Buffer
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
 		env := map[string]string{
 			"PORT":                       "0",
-			"AUTH_TOKEN":                 "valid-token",
-			"AUTH_USERNAME":              "only-username",
+			"AUTH_CREDENTIALS":           credentialEnv("valid", "valid-token"),
 			"EMAIL_TRIGGER_LOGIN_EMAIL":  "only-imap-user@example.com",
 			"TELEGRAM_BOT_TOKEN":         "only-tg-token",
 			"EMAIL_DELIVER_SENDER_EMAIL": "only-sender@example.com",
@@ -774,7 +813,6 @@ func TestBuildDispatcher_PartialConfigWarnings(t *testing.T) {
 		logs := buf.String()
 		expectedWarnings := []string{
 			"AES_128_ECB_IV is deprecated and ignored; random IV is generated per message",
-			"partial webhook basic auth configuration detected; both AUTH_USERNAME and AUTH_PASSWORD are required for basic auth",
 			"partial IMAP trigger configuration detected; IMAP listener will not start unless all required fields are set",
 			"partial telegram configuration detected; telegram target disabled",
 			"partial email configuration detected; email target disabled",
@@ -793,10 +831,9 @@ func TestBuildDispatcher_PartialConfigWarnings(t *testing.T) {
 		defer cancel()
 
 		env := map[string]string{
-			"PORT":          "0",
-			"RUN_TRIGGER":   "true",
-			"AUTH_USERNAME": "webhook-admin",
-			"AUTH_PASSWORD": "webhook-password",
+			"PORT":             "0",
+			"RUN_TRIGGER":      "true",
+			"AUTH_CREDENTIALS": basicCredentialEnv("webhook-basic", "webhook-admin", "webhook-password"),
 		}
 		lookup := func(k string) string { return env[k] }
 
@@ -850,12 +887,12 @@ func TestRun_ConcurrentIsolatedLoggers(t *testing.T) {
 
 	env1 := map[string]string{
 		"PORT":                 "0",
-		"AUTH_TOKEN":           "token-instance-1",
+		"AUTH_CREDENTIALS":     credentialEnv("i1", "token-instance-1"),
 		"BARK_DEVICE_KEY_LIST": "instance-1-bark-key",
 	}
 	env2 := map[string]string{
 		"PORT":               "0",
-		"AUTH_TOKEN":         "token-instance-2",
+		"AUTH_CREDENTIALS":   credentialEnv("i2", "token-instance-2"),
 		"TELEGRAM_BOT_TOKEN": "instance-2-tg-token",
 		"TELEGRAM_CHAT_ID":   "777888999",
 	}
@@ -925,7 +962,7 @@ func TestRun_TrustedProxiesAndPipelineLoggerWired(t *testing.T) {
 	// and configure REGEX_FILTER_BLACK to trigger pipeline filter logging.
 	env := map[string]string{
 		"PORT":               "0",
-		"AUTH_TOKEN":         "wired-test-token",
+		"AUTH_CREDENTIALS":   credentialEnv("wired", "wired-test-token"),
 		"TRUSTED_PROXIES":    "198.51.100.0/24",
 		"REGEX_FILTER_BLACK": `["^blocked_word"]`,
 	}
@@ -977,5 +1014,231 @@ func TestRun_TrustedProxiesAndPipelineLoggerWired(t *testing.T) {
 	// 2. Pipeline logger must write to stdout buffer (`buf`), not global stderr.
 	if !strings.Contains(logs, "pipeline: message rejected by filter strategy") {
 		t.Errorf("expected pipeline log in stdout buffer, got:\n%s", logs)
+	}
+}
+
+func TestRun_MultiCredentialKeepsWebhookEnabledUnderRunTrigger(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var buf bytes.Buffer
+	readyCh := make(chan string, 1)
+
+	env := map[string]string{
+		"PORT":             "0",
+		"RUN_TRIGGER":      "true",
+		"AUTH_CREDENTIALS": `[{"name":"dev1","token":"my-tok"}]`,
+	}
+	lookup := func(k string) string { return env[k] }
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(ctx, nil, &buf, lookup, readyCh)
+	}()
+
+	select {
+	case addr := <-readyCh:
+		if addr == "" {
+			t.Fatal("expected non-empty bound address")
+		}
+	case err := <-errCh:
+		t.Fatalf("run failed before ready: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for server ready")
+	}
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected nil error on shutdown, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for run to exit")
+	}
+}
+
+func TestRun_E2E_MultiCredentialAuth(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var buf bytes.Buffer
+	readyCh := make(chan string, 1)
+
+	env := map[string]string{
+		"PORT": "0",
+		"AUTH_CREDENTIALS": `[{"name":"device-1","token":"tok-1"},` +
+			`{"name":"tablet","username":"tab-user","password":"tab-pass"},` +
+			`{"name":"device-2","token":"tok-2","username":"dual-user","password":"dual-pass"}]`,
+	}
+	lookup := func(k string) string { return env[k] }
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(ctx, nil, &buf, lookup, readyCh)
+	}()
+
+	var addr string
+	select {
+	case addr = <-readyCh:
+	case err := <-errCh:
+		t.Fatalf("run exited before ready: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for server ready")
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// 1. Bearer token of a token-only credential.
+	req1, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/webhook", addr), bytes.NewBufferString(`{"msg_type":"text"}`))
+	req1.Header.Set("Authorization", "Bearer tok-1")
+	resp1, err := client.Do(req1)
+	if err != nil {
+		t.Fatalf("request 1 failed: %v", err)
+	}
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK {
+		t.Errorf("request 1: expected 200 OK, got %d", resp1.StatusCode)
+	}
+
+	// 2. Basic pair of a basic-only credential.
+	req2, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/webhook", addr), bytes.NewBufferString(`{"msg_type":"text"}`))
+	req2.SetBasicAuth("tab-user", "tab-pass")
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("request 2 failed: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("request 2: expected 200 OK, got %d", resp2.StatusCode)
+	}
+
+	// 3. Bearer token of a dual credential.
+	req3, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/webhook", addr), bytes.NewBufferString(`{"msg_type":"text"}`))
+	req3.Header.Set("Authorization", "Bearer tok-2")
+	resp3, err := client.Do(req3)
+	if err != nil {
+		t.Fatalf("request 3 failed: %v", err)
+	}
+	_ = resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		t.Errorf("request 3: expected 200 OK, got %d", resp3.StatusCode)
+	}
+
+	// 4. Cross-credential assembly (device-1's token name with tablet's password) must fail.
+	req4, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/webhook", addr), bytes.NewBufferString(`{"msg_type":"text"}`))
+	req4.SetBasicAuth("tab-user", "dual-pass")
+	resp4, err := client.Do(req4)
+	if err != nil {
+		t.Fatalf("request 4 failed: %v", err)
+	}
+	_ = resp4.Body.Close()
+	if resp4.StatusCode != http.StatusUnauthorized {
+		t.Errorf("request 4: expected 401 for cross-credential assembly, got %d", resp4.StatusCode)
+	}
+
+	// 5. Unknown token.
+	req5, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/webhook", addr), bytes.NewBufferString(`{"msg_type":"text"}`))
+	req5.Header.Set("Authorization", "Bearer wrong-token")
+	resp5, err := client.Do(req5)
+	if err != nil {
+		t.Fatalf("request 5 failed: %v", err)
+	}
+	_ = resp5.Body.Close()
+	if resp5.StatusCode != http.StatusUnauthorized {
+		t.Errorf("request 5: expected 401 Unauthorized, got %d", resp5.StatusCode)
+	}
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected nil on shutdown, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for run to exit")
+	}
+
+	logs := buf.String()
+	if !strings.Contains(logs, "configured webhook credentials") || !strings.Contains(logs, "count=3") {
+		t.Errorf("expected configured credentials info with count=3 in logs, got:\n%s", logs)
+	}
+	// The audit trail must attribute each request to the matching credential name.
+	for _, want := range []string{"credential=device-1", "credential=tablet", "credential=device-2"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("expected %s in the authorized audit log, got:\n%s", want, logs)
+		}
+	}
+	// The removed legacy/union machinery must leave no trace in the logs.
+	for _, forbidden := range []string{"both legacy auth", "duplicate webhook credentials", "conflicting factors removed"} {
+		if strings.Contains(logs, forbidden) {
+			t.Errorf("log must not mention the removed union logic (%q), got:\n%s", forbidden, logs)
+		}
+	}
+}
+
+// TestRun_FailsFastOnDuplicateAuthenticationFactor pins that the strict duplicate-factor rule is
+// enforced on the real startup path, not just inside parseCredentials.
+func TestRun_FailsFastOnDuplicateAuthenticationFactor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	env := map[string]string{
+		"PORT":             "0",
+		"AUTH_CREDENTIALS": `[{"name":"a","token":"same"},{"name":"b","token":"same"}]`,
+	}
+	err := run(ctx, nil, io.Discard, func(k string) string { return env[k] })
+	if err == nil {
+		t.Fatal("expected startup to fail on duplicate authentication factors")
+	}
+	if !strings.Contains(err.Error(), `duplicate "token" already used by entry 1`) {
+		t.Errorf("expected a duplicate-factor error, got: %v", err)
+	}
+}
+
+// TestRun_FailsFastWhenWebhookWouldBeServedWithoutCredentials pins the removal of the implicit
+// open-access mode: if the process is going to serve the HTTP webhook, it must have credentials.
+// The escape hatch is IMAP-only mode (RUN_TRIGGER=true), which serves no HTTP at all.
+func TestRun_FailsFastWhenWebhookWouldBeServedWithoutCredentials(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+	}{
+		{
+			name: "no authentication configured at all",
+			env:  map[string]string{"PORT": "0"},
+		},
+		{
+			name: "legacy variables are no longer honoured, so this is still unauthenticated",
+			env:  map[string]string{"PORT": "0", "AUTH_TOKEN": "orphan-token"},
+		},
+		{
+			name: "half-configured legacy basic is no longer honoured either",
+			env:  map[string]string{"PORT": "0", "AUTH_USERNAME": "admin"},
+		},
+		{
+			name: "blank AUTH_CREDENTIALS counts as unconfigured",
+			env:  map[string]string{"PORT": "0", "AUTH_CREDENTIALS": "   "},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// An already-cancelled context keeps this test hang-proof: if a regression makes the
+			// process serve the webhook instead of failing fast, run() returns nil on shutdown
+			// and the assertion below fails rather than blocking forever.
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			err := run(ctx, nil, io.Discard, func(k string) string { return tc.env[k] })
+			if err == nil {
+				t.Fatal("expected startup to fail, got nil error (webhook would be served unauthenticated)")
+			}
+			if !strings.Contains(err.Error(), "AUTH_CREDENTIALS") {
+				t.Errorf("expected the error to name AUTH_CREDENTIALS, got: %v", err)
+			}
+		})
 	}
 }

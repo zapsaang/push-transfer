@@ -3,7 +3,9 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -16,31 +18,30 @@ type ServerConfig struct {
 	TrustedProxies []string
 }
 
-// AuthConfig contains authentication credentials for webhooks and APIs.
-type AuthConfig struct {
+// Credential represents an accepted Webhook identity: Bearer token, HTTP Basic pair, or both.
+// Name is used only for audit logs and never contains secrets.
+type Credential struct {
+	Name     string
+	Token    string
 	Username string
 	Password string
-	Token    string
 }
 
-// HasTokenAuth reports whether non-empty Bearer token authentication is configured.
-func (a AuthConfig) HasTokenAuth() bool {
-	return strings.TrimSpace(a.Token) != ""
+// AuthConfig contains the accepted Webhook identities.
+//
+// There is exactly one credential source: the AUTH_CREDENTIALS JSON array. The former
+// AUTH_TOKEN / AUTH_USERNAME + AUTH_PASSWORD single-credential variables were removed rather than
+// kept as a compatibility channel, so there is no union, no precedence rule and no way for a
+// half-configured legacy variable to silently leave the webhook unauthenticated.
+type AuthConfig struct {
+	Credentials []Credential
 }
 
-// HasBasicAuth reports whether both username and password for HTTP Basic Auth are configured.
-func (a AuthConfig) HasBasicAuth() bool {
-	return strings.TrimSpace(a.Username) != "" && strings.TrimSpace(a.Password) != ""
-}
-
-// HasPartialBasicAuth reports whether exactly one of username or password is set.
-func (a AuthConfig) HasPartialBasicAuth() bool {
-	return (strings.TrimSpace(a.Username) != "") != (strings.TrimSpace(a.Password) != "")
-}
-
-// HasWebhookAuth reports whether either Token or Basic authentication is configured.
+// HasWebhookAuth reports whether at least one credential is configured. Credentials coming from
+// parseCredentials are always usable (at least one token or a complete Basic pair each), so a
+// non-empty list is exactly "the webhook can authenticate callers".
 func (a AuthConfig) HasWebhookAuth() bool {
-	return a.HasTokenAuth() || a.HasBasicAuth()
+	return len(a.Credentials) > 0
 }
 
 // TelegramConfig contains credentials and endpoint for Telegram message dispatching.
@@ -188,15 +189,19 @@ func LoadFromLookup(lookup func(string) string) (*Config, error) {
 	runTriggerStr := strings.TrimSpace(strings.ToLower(lookup("RUN_TRIGGER")))
 	runTrigger := runTriggerStr == "true" || runTriggerStr == "1"
 
+	authCredsRaw := lookup("AUTH_CREDENTIALS")
+	authCreds, err := parseCredentials(authCredsRaw)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Server: ServerConfig{
 			Port:           port,
 			TrustedProxies: trustedProxies,
 		},
 		Auth: AuthConfig{
-			Username: strings.TrimSpace(lookup("AUTH_USERNAME")),
-			Password: strings.TrimSpace(lookup("AUTH_PASSWORD")),
-			Token:    strings.TrimSpace(lookup("AUTH_TOKEN")),
+			Credentials: authCreds,
 		},
 		RunTrigger: runTrigger,
 	}
@@ -387,4 +392,136 @@ func parseJSONRegexList(val, name string) ([]string, error) {
 	}
 
 	return rawItems, nil
+}
+
+const (
+	maxAuthCredentials       = 64
+	maxCredentialNameLen     = 64
+	reservedCredentialPrefix = "env:"
+)
+
+type credentialJSON struct {
+	Name     *string `json:"name"`
+	Token    *string `json:"token"`
+	Username *string `json:"username"`
+	Password *string `json:"password"`
+}
+
+// basicAuthPair is the comparable key used to detect two entries declaring the same Basic factor.
+type basicAuthPair struct {
+	username string
+	password string
+}
+
+// parseCredentials strictly parses AUTH_CREDENTIALS (V1-V10 of the multi-credential contract).
+//
+// SECURITY: the raw value carries plaintext tokens and passwords, and every error returned here
+// is surfaced through slog by main(). Error messages therefore must never echo `raw`; they may
+// only name the environment variable, the entry number and the offending JSON key.
+func parseCredentials(raw string) ([]Credential, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.DisallowUnknownFields()
+
+	var rawList []credentialJSON
+	if err := dec.Decode(&rawList); err != nil {
+		return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS must be a JSON array of credential objects: %w", err)
+	}
+
+	if extraErr := dec.Decode(&struct{}{}); !errors.Is(extraErr, io.EOF) {
+		if extraErr != nil {
+			return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS must be a JSON array of credential objects: trailing data: %w", extraErr)
+		}
+		return nil, errors.New("environment variable AUTH_CREDENTIALS must be a JSON array of credential objects: trailing data")
+	}
+
+	if len(rawList) == 0 {
+		return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS must contain at least one credential")
+	}
+
+	if len(rawList) > maxAuthCredentials {
+		return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS must not contain more than %d credentials", maxAuthCredentials)
+	}
+
+	creds := make([]Credential, len(rawList))
+	seenNames := make(map[string]struct{}, len(rawList))
+	// An authentication factor can only ever resolve to one audit identity, so two entries
+	// declaring the same factor are rejected outright instead of being silently deduplicated.
+	// This replaces the removed legacy/union merge, where the conflict had to be resolved at
+	// runtime and the losing entry was reported in a startup warning.
+	seenTokens := make(map[string]int, len(rawList))
+	seenBasics := make(map[basicAuthPair]int, len(rawList))
+
+	for i, r := range rawList {
+		entryNum := i + 1
+
+		// Check non-nil but blank fields (V5)
+		if r.Name != nil && strings.TrimSpace(*r.Name) == "" {
+			return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS entry %d: %q must not be blank", entryNum, "name")
+		}
+		if r.Token != nil && strings.TrimSpace(*r.Token) == "" {
+			return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS entry %d: %q must not be blank", entryNum, "token")
+		}
+		if r.Username != nil && strings.TrimSpace(*r.Username) == "" {
+			return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS entry %d: %q must not be blank", entryNum, "username")
+		}
+		if r.Password != nil && strings.TrimSpace(*r.Password) == "" {
+			return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS entry %d: %q must not be blank", entryNum, "password")
+		}
+
+		hasUser := r.Username != nil
+		hasPass := r.Password != nil
+		if hasUser != hasPass {
+			return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS entry %d: \"username\" and \"password\" must be provided together", entryNum)
+		}
+
+		hasToken := r.Token != nil
+		hasBasic := hasUser && hasPass
+		if !hasToken && !hasBasic {
+			return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS entry %d must set either \"token\" or both \"username\" and \"password\"", entryNum)
+		}
+
+		name := fmt.Sprintf("credential-%d", entryNum)
+		if r.Name != nil {
+			name = strings.TrimSpace(*r.Name)
+			if strings.HasPrefix(name, reservedCredentialPrefix) {
+				return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS entry %d: \"name\" must not start with reserved prefix %q", entryNum, reservedCredentialPrefix)
+			}
+			if utf8.RuneCountInString(name) > maxCredentialNameLen {
+				return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS entry %d: \"name\" must not exceed %d characters", entryNum, maxCredentialNameLen)
+			}
+		}
+
+		if _, exists := seenNames[name]; exists {
+			return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS entry %d: duplicate credential name %q", entryNum, name)
+		}
+		seenNames[name] = struct{}{}
+
+		c := Credential{
+			Name: name,
+		}
+		if hasToken {
+			c.Token = strings.TrimSpace(*r.Token)
+			if first, dup := seenTokens[c.Token]; dup {
+				return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS entry %d: duplicate \"token\" already used by entry %d", entryNum, first)
+			}
+			seenTokens[c.Token] = entryNum
+		}
+		if hasBasic {
+			c.Username = strings.TrimSpace(*r.Username)
+			c.Password = strings.TrimSpace(*r.Password)
+			pair := basicAuthPair{username: c.Username, password: c.Password}
+			if first, dup := seenBasics[pair]; dup {
+				return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS entry %d: duplicate \"username\"/\"password\" pair already used by entry %d", entryNum, first)
+			}
+			seenBasics[pair] = entryNum
+		}
+		creds[i] = c
+	}
+
+	return creds, nil
 }

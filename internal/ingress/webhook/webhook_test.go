@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zapsaang/push-transfer/internal/config"
 	"github.com/zapsaang/push-transfer/internal/deliver"
 	"github.com/zapsaang/push-transfer/internal/ingress/webhook"
 	"github.com/zapsaang/push-transfer/internal/model"
@@ -20,29 +21,36 @@ func TestAuth_ConstantTimeCompare(t *testing.T) {
 	token := "my-secret-token-12345"
 
 	testCases := []struct {
-		name     string
-		input    string
-		expected bool
+		name         string
+		authHeader   string
+		expectedCode int
 	}{
-		{"exact match", "my-secret-token-12345", true},
-		{"same length mismatch", "my-secret-token-12346", false},
-		{"shorter prefix", "my-secret-token", false},
-		{"longer suffix", "my-secret-token-12345-extra", false},
-		{"empty input", "", false},
-		{"single char diff at start", "xy-secret-token-12345", false},
+		{"exact match", "Bearer my-secret-token-12345", http.StatusOK},
+		{"same length mismatch", "Bearer my-secret-token-12346", http.StatusUnauthorized},
+		{"shorter prefix", "Bearer my-secret-token", http.StatusUnauthorized},
+		{"longer suffix", "Bearer my-secret-token-12345-extra", http.StatusUnauthorized},
+		{"empty input", "", http.StatusUnauthorized},
+		{"single char diff at start", "Bearer xy-secret-token-12345", http.StatusUnauthorized},
 	}
+
+	h := webhook.NewHandler(webhook.HandlerOptions{
+		Credentials: []config.Credential{{Token: token}},
+		Processor:   &mockProcessor{pass: true},
+		Deliverer:   &mockDeliverer{},
+	})
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := webhook.SecureCompare(token, tc.input)
-			if got != tc.expected {
-				t.Errorf("SecureCompare(%q, %q) = %v; want %v", token, tc.input, got, tc.expected)
+			req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+			if tc.authHeader != "" {
+				req.Header.Set("Authorization", tc.authHeader)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.expectedCode {
+				t.Errorf("request auth %q got status %d; want %d", tc.authHeader, rec.Code, tc.expectedCode)
 			}
 		})
-	}
-
-	if !webhook.SecureCompare("", "") {
-		t.Error("expected empty string to match empty string")
 	}
 }
 
@@ -102,9 +110,9 @@ func TestWebhook_HTTPStatusCodes(t *testing.T) {
 
 	t.Run("no or invalid Bearer token -> 401 Unauthorized", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Token:     validToken,
-			Processor: &mockProcessor{pass: true},
-			Deliverer: &mockDeliverer{},
+			Credentials: []config.Credential{{Token: validToken}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
 		})
 
 		// 1. No auth header
@@ -129,9 +137,9 @@ func TestWebhook_HTTPStatusCodes(t *testing.T) {
 
 	t.Run("malformed JSON -> 400 Bad Request", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Token:     validToken,
-			Processor: &mockProcessor{pass: true},
-			Deliverer: &mockDeliverer{},
+			Credentials: []config.Credential{{Token: validToken}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
 		})
 
 		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{invalid-json`))
@@ -146,9 +154,9 @@ func TestWebhook_HTTPStatusCodes(t *testing.T) {
 
 	t.Run("trailing JSON garbage or multiple JSON objects -> 400 Bad Request", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Token:     validToken,
-			Processor: &mockProcessor{pass: true},
-			Deliverer: &mockDeliverer{},
+			Credentials: []config.Credential{{Token: validToken}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
 		})
 
 		for _, payload := range []string{
@@ -168,9 +176,9 @@ func TestWebhook_HTTPStatusCodes(t *testing.T) {
 
 	t.Run("filter blocked message -> 200 OK + status blocked", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Token:     validToken,
-			Processor: &mockProcessor{pass: false}, // Blocked by filter
-			Deliverer: &mockDeliverer{},
+			Credentials: []config.Credential{{Token: validToken}},
+			Processor:   &mockProcessor{pass: false}, // Blocked by filter
+			Deliverer:   &mockDeliverer{},
 		})
 
 		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text","title":"spam"}`))
@@ -193,9 +201,9 @@ func TestWebhook_HTTPStatusCodes(t *testing.T) {
 
 	t.Run("successful process and deliver -> 200 OK + status success", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Token:     validToken,
-			Processor: &mockProcessor{pass: true},
-			Deliverer: &mockDeliverer{},
+			Credentials: []config.Credential{{Token: validToken}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
 		})
 
 		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text","title":"10086","content":"test"}`))
@@ -218,9 +226,9 @@ func TestWebhook_HTTPStatusCodes(t *testing.T) {
 
 	t.Run("all downstream deliveries fail -> 502 Bad Gateway + status deliver_failed", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Token:     validToken,
-			Processor: &mockProcessor{pass: true},
-			Deliverer: &mockDeliverer{err: deliver.ErrAllTargetsFailed},
+			Credentials: []config.Credential{{Token: validToken}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{err: deliver.ErrAllTargetsFailed},
 		})
 
 		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text","title":"10086"}`))
@@ -243,7 +251,7 @@ func TestWebhook_HTTPStatusCodes(t *testing.T) {
 
 	t.Run("method not allowed -> 405", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Token: validToken,
+			Credentials: []config.Credential{{Token: validToken}},
 		})
 		req := httptest.NewRequest(http.MethodGet, "/webhook", http.NoBody)
 		rec := httptest.NewRecorder()
@@ -256,8 +264,8 @@ func TestWebhook_HTTPStatusCodes(t *testing.T) {
 
 	t.Run("pipeline processor error -> 500 Internal Server Error", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Token:     validToken,
-			Processor: &mockProcessor{err: errors.New("pipeline broken")},
+			Credentials: []config.Credential{{Token: validToken}},
+			Processor:   &mockProcessor{err: errors.New("pipeline broken")},
 		})
 		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
 		req.Header.Set("Authorization", "Bearer "+validToken)
@@ -271,9 +279,9 @@ func TestWebhook_HTTPStatusCodes(t *testing.T) {
 
 	t.Run("request body exceeding 1MB default limit -> 413 Request Entity Too Large", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Token:     validToken,
-			Processor: &mockProcessor{pass: true},
-			Deliverer: &mockDeliverer{},
+			Credentials: []config.Credential{{Token: validToken}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
 		})
 
 		largeContent := strings.Repeat("a", (1<<20)+512*1024) // 1.5MB
@@ -298,7 +306,7 @@ func TestWebhook_HTTPStatusCodes(t *testing.T) {
 
 	t.Run("custom MaxBodyBytes limit enforced", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Token:        validToken,
+			Credentials:  []config.Credential{{Token: validToken}},
 			MaxBodyBytes: 256,
 			Processor:    &mockProcessor{pass: true},
 			Deliverer:    &mockDeliverer{},
@@ -319,10 +327,9 @@ func TestWebhook_HTTPStatusCodes(t *testing.T) {
 func TestWebhook_BasicAndDualAuth(t *testing.T) {
 	t.Run("Basic Auth only", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Username:  "admin",
-			Password:  "secret-pass",
-			Processor: &mockProcessor{pass: true},
-			Deliverer: &mockDeliverer{},
+			Credentials: []config.Credential{{Username: "admin", Password: "secret-pass"}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
 		})
 
 		// 1. Valid Basic Auth -> 200 OK
@@ -363,9 +370,10 @@ func TestWebhook_BasicAndDualAuth(t *testing.T) {
 
 	t.Run("Dual Auth (Token and Basic Auth both configured)", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Token:     "bearer-token-xyz",
-			Username:  "admin",
-			Password:  "secret-pass",
+			Credentials: []config.Credential{
+				{Token: "bearer-token-xyz"},
+				{Username: "admin", Password: "secret-pass"},
+			},
 			Processor: &mockProcessor{pass: true},
 			Deliverer: &mockDeliverer{},
 		})
@@ -636,9 +644,9 @@ func TestWebhook_QueryTokenAuth(t *testing.T) {
 
 	newHandler := func() *webhook.Handler {
 		return webhook.NewHandler(webhook.HandlerOptions{
-			Token:     validToken,
-			Processor: &mockProcessor{pass: true},
-			Deliverer: &mockDeliverer{},
+			Credentials: []config.Credential{{Token: validToken}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
 		})
 	}
 
@@ -676,9 +684,10 @@ func TestWebhook_QueryTokenAuth(t *testing.T) {
 
 	t.Run("query token also works when Basic Auth is configured", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Token:     validToken,
-			Username:  "admin",
-			Password:  "secret",
+			Credentials: []config.Credential{
+				{Token: validToken},
+				{Username: "admin", Password: "secret"},
+			},
 			Processor: &mockProcessor{pass: true},
 			Deliverer: &mockDeliverer{},
 		})
@@ -692,7 +701,7 @@ func TestWebhook_QueryTokenAuth(t *testing.T) {
 		}
 	})
 
-	t.Run("no token configured -> query token is irrelevant and access is allowed", func(t *testing.T) {
+	t.Run("no credentials configured -> query token is irrelevant and access is denied", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
 			Processor: &mockProcessor{pass: true},
 			Deliverer: &mockDeliverer{},
@@ -701,8 +710,8 @@ func TestWebhook_QueryTokenAuth(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200 when no authentication is configured, got %d", rec.Code)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("expected fail-closed 401 when no credential is configured, got %d", rec.Code)
 		}
 	})
 
@@ -721,10 +730,9 @@ func TestWebhook_QueryTokenAuth(t *testing.T) {
 func TestWebhook_UnauthorizedChallenge(t *testing.T) {
 	t.Run("Basic Auth configured advertises the Basic challenge", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Username:  "admin",
-			Password:  "secret",
-			Processor: &mockProcessor{pass: true},
-			Deliverer: &mockDeliverer{},
+			Credentials: []config.Credential{{Username: "admin", Password: "secret"}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
 		})
 		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
 		rec := httptest.NewRecorder()
@@ -741,9 +749,9 @@ func TestWebhook_UnauthorizedChallenge(t *testing.T) {
 
 	t.Run("Bearer-only configuration does not advertise a Basic challenge", func(t *testing.T) {
 		h := webhook.NewHandler(webhook.HandlerOptions{
-			Token:     "token-only",
-			Processor: &mockProcessor{pass: true},
-			Deliverer: &mockDeliverer{},
+			Credentials: []config.Credential{{Token: "token-only"}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
 		})
 		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
 		rec := httptest.NewRecorder()
@@ -754,6 +762,272 @@ func TestWebhook_UnauthorizedChallenge(t *testing.T) {
 		}
 		if challenge := rec.Header().Get("WWW-Authenticate"); challenge != "" {
 			t.Errorf("expected no WWW-Authenticate for token-only auth, got %q", challenge)
+		}
+	})
+}
+
+func TestWebhook_MultiCredentialAuth(t *testing.T) {
+	creds := []config.Credential{
+		{Name: "phone-a", Token: "tok-a"},
+		{Name: "tablet", Username: "tab-user", Password: "tab-pass"},
+		{Name: "phone-b", Token: "tok-b", Username: "phone-user", Password: "phone-pass"},
+	}
+
+	h := webhook.NewHandler(webhook.HandlerOptions{
+		Credentials: creds,
+		Processor:   &mockProcessor{pass: true},
+		Deliverer:   &mockDeliverer{},
+	})
+
+	t.Run("bearer tok-a -> 200", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+		req.Header.Set("Authorization", "Bearer tok-a")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", rec.Code)
+		}
+	})
+
+	t.Run("query ?token=tok-a -> 200", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/webhook?token=tok-a", bytes.NewBufferString(`{"msg_type":"text"}`))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", rec.Code)
+		}
+	})
+
+	t.Run("basic tab-user:tab-pass -> 200", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+		req.SetBasicAuth("tab-user", "tab-pass")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", rec.Code)
+		}
+	})
+
+	t.Run("bearer tok-b -> 200", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+		req.Header.Set("Authorization", "Bearer tok-b")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", rec.Code)
+		}
+	})
+
+	t.Run("basic phone-user:phone-pass -> 200", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+		req.SetBasicAuth("phone-user", "phone-pass")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", rec.Code)
+		}
+	})
+
+	t.Run("cross credential basic mismatch -> 401", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+		req.SetBasicAuth("tab-user", "phone-pass")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401, got %d", rec.Code)
+		}
+	})
+
+	t.Run("missing credentials with mixed set advertises basic challenge", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401, got %d", rec.Code)
+		}
+		challenge := rec.Header().Get("WWW-Authenticate")
+		if !strings.HasPrefix(challenge, "Basic ") {
+			t.Errorf("expected Basic WWW-Authenticate, got %q", challenge)
+		}
+	})
+
+	t.Run("multiple tokens only configuration does not advertise basic challenge", func(t *testing.T) {
+		hTokens := webhook.NewHandler(webhook.HandlerOptions{
+			Credentials: []config.Credential{
+				{Name: "p1", Token: "tok-1"},
+				{Name: "p2", Token: "tok-2"},
+			},
+			Processor: &mockProcessor{pass: true},
+			Deliverer: &mockDeliverer{},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+		rec := httptest.NewRecorder()
+		hTokens.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401, got %d", rec.Code)
+		}
+		if challenge := rec.Header().Get("WWW-Authenticate"); challenge != "" {
+			t.Errorf("expected no WWW-Authenticate header, got %q", challenge)
+		}
+	})
+}
+
+// TestWebhook_NoCredentialsIsFailClosed pins that there is no open-access mode: a handler built
+// without credentials denies every request. Unauthenticated serving is prevented at startup
+// (cmd/push-transfer), so reaching this state is a programming error and must fail closed.
+func TestWebhook_NoCredentialsIsFailClosed(t *testing.T) {
+	cases := []struct {
+		name  string
+		creds []config.Credential
+	}{
+		{"nil credentials", nil},
+		{"empty slice credentials", []config.Credential{}},
+		{"blank-only credentials", []config.Credential{{Token: "  "}, {Username: " ", Password: ""}}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := webhook.NewHandler(webhook.HandlerOptions{
+				Credentials: tc.creds,
+				Processor:   &mockProcessor{pass: true},
+				Deliverer:   &mockDeliverer{},
+			})
+
+			for _, auth := range []struct {
+				name     string
+				setupReq func(r *http.Request)
+			}{
+				{"no auth", func(_ *http.Request) {}},
+				{"with bearer", func(r *http.Request) { r.Header.Set("Authorization", "Bearer anything") }},
+				{"with query token", func(r *http.Request) { r.URL.RawQuery = "token=anything" }},
+				{"with basic auth", func(r *http.Request) { r.SetBasicAuth("admin", "admin") }},
+			} {
+				req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+				auth.setupReq(req)
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+
+				if rec.Code != http.StatusUnauthorized {
+					t.Errorf("%s: expected fail-closed 401, got %d", auth.name, rec.Code)
+				}
+			}
+		})
+	}
+}
+
+func TestWebhook_DeclaredButBlankFailClosed(t *testing.T) {
+	// If credentials slice is declared (len > 0), but all items contain only empty/blank values,
+	// NewHandler must fail-closed: reject every request with 401, never allow open access.
+	h := webhook.NewHandler(webhook.HandlerOptions{
+		Credentials: []config.Credential{
+			{Token: ""},
+			{Username: "   ", Password: ""},
+		},
+		Processor: &mockProcessor{pass: true},
+		Deliverer: &mockDeliverer{},
+	})
+
+	for _, tc := range []struct {
+		name     string
+		setupReq func(r *http.Request)
+	}{
+		{"no auth", func(_ *http.Request) {}},
+		{"with bearer", func(r *http.Request) { r.Header.Set("Authorization", "Bearer anything") }},
+		{"with query token", func(r *http.Request) { r.URL.RawQuery = "token=anything" }},
+		{"with basic auth", func(r *http.Request) { r.SetBasicAuth("admin", "admin") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+			tc.setupReq(req)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("expected fail-closed 401, got %d", rec.Code)
+			}
+		})
+	}
+}
+
+// TestWebhook_AuthorizedAuditLog pins the audit contract of the multi-credential design:
+// a successful authentication records exactly the credential name (never the secret), and an
+// open-access deployment (no credentials declared) records no authorization line at all.
+func TestWebhook_AuthorizedAuditLog(t *testing.T) {
+	newLogger := func(buf *bytes.Buffer) *slog.Logger {
+		return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	}
+
+	t.Run("successful auth logs the credential name only", func(t *testing.T) {
+		var buf bytes.Buffer
+		const secret = "tok-super-secret"
+		h := webhook.NewHandler(webhook.HandlerOptions{
+			Credentials: []config.Credential{{Name: "phone-a", Token: secret}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
+			Logger:      newLogger(&buf),
+		})
+
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+		req.Header.Set("Authorization", "Bearer "+secret)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		logs := buf.String()
+		if !strings.Contains(logs, "credential=phone-a") {
+			t.Errorf("expected credential name in audit log, got:\n%s", logs)
+		}
+		if strings.Contains(logs, secret) {
+			t.Errorf("audit log must never contain credential material, got:\n%s", logs)
+		}
+	})
+
+	t.Run("credential-less handler logs a fail-closed warning and no authorization line", func(t *testing.T) {
+		var buf bytes.Buffer
+		h := webhook.NewHandler(webhook.HandlerOptions{
+			Processor: &mockProcessor{pass: true},
+			Deliverer: &mockDeliverer{},
+			Logger:    newLogger(&buf),
+		})
+
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected fail-closed 401, got %d", rec.Code)
+		}
+		logs := buf.String()
+		if strings.Contains(logs, "webhook authorized") {
+			t.Errorf("a denied request must not log an authorization line, got:\n%s", logs)
+		}
+		if !strings.Contains(logs, "fail-closed") {
+			t.Errorf("expected a fail-closed warning for a credential-less handler, got:\n%s", logs)
+		}
+	})
+
+	t.Run("failed auth must not log any credential name", func(t *testing.T) {
+		var buf bytes.Buffer
+		h := webhook.NewHandler(webhook.HandlerOptions{
+			Credentials: []config.Credential{{Name: "phone-a", Token: "tok-a"}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
+			Logger:      newLogger(&buf),
+		})
+
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+		req.Header.Set("Authorization", "Bearer wrong")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", rec.Code)
+		}
+		logs := buf.String()
+		if strings.Contains(logs, "credential=phone-a") || strings.Contains(logs, "webhook authorized") {
+			t.Errorf("failed auth must not log an authorization line, got:\n%s", logs)
 		}
 	})
 }

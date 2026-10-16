@@ -45,12 +45,12 @@ flowchart TD
 
 | 目录 / 文件 | 职责 | 核心依赖 / 规范 |
 |------------|------|----------------|
-| `cmd/push-transfer/main.go` | 程序入口与组装根。负责 CLI 参数解析 (`-v`/`-version`/`-h`，`-h` 退出码为 0)、显式结构化日志 (`*slog.Logger`) 全链路依赖注入（无全局 `slog.SetDefault` 污染）、HTTP Server 防御性超时工厂 (`newHTTPServer`)、后台协程生命周期对称纳管 (`WaitGroup`)、半配置/弃用项告警与平滑停机。 | `log/slog`, `net/http` |
-| `internal/config/` | 运行时配置中心 (SSoT)。强类型读取环境变量，支持解耦注入 (`LoadFromLookup`)、默认值容错、可选通道按需启用/半配置检测 (`Enabled`/`HasPartialConfig`)、`BARK_GET_URL` 向后兼容推导 `PostURL` 与 Webhook 双鉴权配置解析。 | 标准库 |
+| `cmd/push-transfer/main.go` | 程序入口与组装根。负责 CLI 参数解析 (`-v`/`-version`/`-h`，`-h` 退出码为 0)、显式结构化日志 (`*slog.Logger`) 全链路依赖注入（无全局 `slog.SetDefault` 污染）、**「无凭据不得对外服务 Webhook」的 fail-fast 启动门禁**（仅 `RUN_TRIGGER=true` 纯 IMAP 模式可无凭据运行）、HTTP Server 防御性超时工厂 (`newHTTPServer`)、后台协程生命周期对称纳管 (`WaitGroup`)、半配置/弃用项告警与平滑停机。 | `log/slog`, `net/http` |
+| `internal/config/` | 运行时配置中心 (SSoT)。强类型读取环境变量，支持解耦注入 (`LoadFromLookup`)、默认值容错、可选通道按需启用/半配置检测 (`Enabled`/`HasPartialConfig`)、`BARK_GET_URL` 向后兼容推导 `PostURL`、`AUTH_CREDENTIALS` 多凭据严格解析（**Webhook 凭据的唯一来源**：V1–V12 校验、name 唯一性、认证要素唯一性）。 | 标准库 |
 | `internal/model/` | 核心领域模型。定义 `Message`、具备防崩溃防御性解析的 `FlexibleTimestamp`（容错毫秒/非数字/null/负值）、多级时间戳兜底回退 (`firstValidTimestamp`) 与并发深拷贝隔离 (`Message.Clone()`)。 | 标准库 |
 | `internal/pipeline/` | 策略处理流水线。基于 `regexp2` 支持高级零宽断言与 ReDoS 超时截断，执行白名单放行、黑名单拦截、验证码第1捕获组提取与紧急呼叫标记。 | `github.com/dlclark/regexp2` |
 | `internal/deliver/` | 并发分发出口。通过 `Dispatcher` 克隆消息副本 (`Message.Clone()`) 扇出并发分发；提供共享调优连接池 (`NewDefaultHTTPClient`)；实现 Bark (AES-128-CBC + 每消息随机 IV，且按 Bark 官方协议把 `iv` 与 `ciphertext` 作为两个独立顶层参数发送；多设备/多 URL 二级并发扇出)、Telegram Bot API (HTML 实体安全截断 + 校验响应体 `ok` 字段而非仅看 HTTP 状态码)、SMTP SSL 邮件投递 (RFC 2047 标题编码 + CRLF 注入清洗 + 会话全链路 Deadline) 与 Console 回显。 | 标准库 `net/http`, `crypto/aes`, `mime` |
-| `internal/ingress/webhook/` | HTTP Webhook 输入端。提供 `/webhook` 与 `/healthz`，实现 1MB 请求体上限 (`http.MaxBytesReader` 防 OOM DoS 返回 `413`)、可信代理边界真实 IP 提取 (`GetRealIP` 仅信任 Loopback/Private 或 `TrustedProxies` 并校验 IP 格式)、Bearer Token（含 `?token=` 查询参数兼容）+ HTTP Basic Auth 恒定时间双鉴权 (`crypto/subtle`)、`401` 时按 RFC 9110 返回 `WWW-Authenticate: Basic` 质询、`X-Forwarded-For` 自右向左跳过受信代理取首个非受信地址，与标准状态码响应。 | 标准库 `net/http`, `crypto/subtle` |
+| `internal/ingress/webhook/` | HTTP Webhook 输入端。提供 `/webhook` 与 `/healthz`，实现 1MB 请求体上限 (`http.MaxBytesReader` 防 OOM DoS 返回 `413`)、可信代理边界真实 IP 提取 (`GetRealIP` 仅信任 Loopback/Private 或 `TrustedProxies` 并校验 IP 格式)、多凭据 Bearer Token（含 `?token=` 查询参数兼容）+ HTTP Basic Auth 恒定时间鉴权（SHA-256 预计算摘要 + 每请求固定 4 次哈希 + 全量扫描整数位运算汇聚，`crypto/subtle`）、`401` 时按 RFC 9110 返回 `WWW-Authenticate: Basic` 质询、`X-Forwarded-For` 自右向左跳过受信代理取首个非受信地址，与标准状态码响应。 | 标准库 `net/http`, `crypto/subtle` |
 | `internal/ingress/imap/` | IMAP 邮件触发输入端。基于 `go-imap/v2` 实现长连接 IDLE 与 TLS 拨号超时控制、自定义邮箱目录 (`EMAIL_TRIGGER_MAILBOX`)、至少一次消费语义（Handler 失败保留 `UNSEEN` 并通过会话内非断连指数退避定时器重试）、毒丸死信隔离（损坏 JSON 标记 `\Seen` 防阻塞，但**主题不匹配的普通邮件一律保持原样、绝不改写未读状态**）、成功会话后重连退避计数归零与 RFC 2047 MIME 多段安全解码。 | `github.com/emersion/go-imap/v2` |
 | `internal/crypto/` | 安全加密底层。提供 Bark AES-128-CBC 每消息随机 IV 加密（返回 `BarkPayload{Ciphertext, IV}`，对应 Bark 的 `ciphertext`/`iv` 两个独立顶层参数）、16 字符 ASCII IV 生成、以及常量时间校验的 PKCS#7 填充/去填充。 | `crypto/aes`, `crypto/cipher` |
 
@@ -64,8 +64,10 @@ flowchart TD
    - 外部传入的短信内容、发件人等属于不可信输入。**绝对禁止**将 `msg.content` 或任何变量直接拼接到 `os.system` / `echo` 中执行，避免产生远程命令执行 (RCE) 漏洞。日志输出必须统一使用结构化日志 (`log/slog`)。
 2. **时间戳容错、多级回退与并发副本隔离**：
    - 移动端上报的时间戳可能为 `None`/`null`，或为 13 位毫秒级时间戳。必须防御空值并在时间戳大于 `1e11` 时自动转为秒，通过多级候选字段回退 (`IncomingTime`/`TransmitTime`/`ReceiveTime`/`SendTime`/`Timestamp`) 渲染时间；并发分发时必须通过 `msg.Clone()` 隔离各下游通道的实体副本。
-3. **安全比较与双鉴权 (Timing Attack Defense)**：
-   - 认证凭据（Bearer Token、HTTP Basic Auth 用户名与密码）比对必须使用恒定时间比较（`crypto/subtle.ConstantTimeCompare`），禁止使用 `==` 进行裸字符串比对。
+3. **安全比较与多凭据鉴权 (Timing Attack Defense)**：
+   - 认证凭据（Bearer Token、HTTP Basic Auth 用户名与密码）比对必须使用恒定时间比较（`crypto/subtle.ConstantTimeCompare`），禁止使用 `==` 进行裸字符串比对。多凭据集合必须全量扫描、不得提前 return，比较次数与输入无关，并由注入计数 comparer 的测试固化。
+   - **凭据本体永不进入日志与诊断信息**：配置校验错误、启动告警、审计日志与回显只允许出现变量名、条目序号、出错字段名与 `Credential.Name`；**严禁**把 token / 口令原文（含 `AUTH_CREDENTIALS` 整串 JSON）拼进 `error` / `WARN` 文案，避免密钥经日志泄漏。因 `main()` 会把配置错误交给 `slog.Error` 落盘，该约束同样适用于 `internal/config` 的失败路径。
+   - **不存在无鉴权服务模式**：Webhook 凭据只有 `AUTH_CREDENTIALS` 一个来源（旧版 `AUTH_TOKEN` / `AUTH_USERNAME` + `AUTH_PASSWORD` 已移除，**不得**以兼容名义加回）。进程若需要对外提供 HTTP Webhook 却没有任何有效凭据，必须在启动时 fail-fast 退出，**严禁**退化为「未配置即放行」；唯一允许无凭据运行的是 `RUN_TRIGGER=true` 的纯 IMAP 模式（不监听 HTTP）。`Handler` 侧同时保留 fail-closed 兜底：凭据集合为空的处理器必须拒绝所有请求。
 4. **网络 I/O 必须显式声明全链路超时与请求体上限 (Timeout & MaxBytes)**：
    - 所有的外部网络调用（HTTP Client/Server、SMTP 建连与协议交互 `conn.SetDeadline`、IMAP TLS 拨号与 IDLE、Telegram/Bark 调用）必须显式指定超时，Webhook 请求体必须通过 `http.MaxBytesReader` 限制体积（默认 1MB），防止慢速攻击、对端挂起或超大请求导致进程阻塞或 OOM。
 5. **事件循环与并发边界清晰**：
@@ -73,7 +75,7 @@ flowchart TD
 6. **HTTP 状态码与 IMAP 消费语义符合真实状态**：
    - `/webhook` 在认证失败时必须返回 `401`；JSON 解析失败返回 `400`；请求体超限返回 `413`；投递下游全部失败或不可恢复错误返回 `5xx`。IMAP 触发器在下游投递失败时必须保留 `UNSEEN` 状态并在会话内退避重试，仅在投递成功或确认为永久损坏的毒丸邮件时标记 `\Seen`。
 7. **配置单源事实 (SSoT) 与按需加载**：
-   - 避免将可选投递方式置于强依赖中；未启用的通道不应阻断服务启动，半配置通道或已弃用配置（如 `AES_128_ECB_IV`）应在启动时输出明确的 `WARN` 结构化日志。
+   - 避免将可选投递方式置于强依赖中；未启用的通道不应阻断服务启动，半配置通道或已弃用配置（如 `AES_128_ECB_IV`）应在启动时输出明确的 `WARN` 结构化日志。新增、调整或**移除**环境变量时，必须同批更新 `.env.example` 与 README 文档，并在本文件同步，保持单源事实闭环。**唯一例外**：Webhook 对外服务所需的凭据缺失属致命错误，必须 fail-fast 而非仅告警。
 
 ---
 
@@ -81,7 +83,7 @@ flowchart TD
 
 > 说明：`docs/` 已被 `.gitignore` 排除（本地审计记录，不随仓库分发），因此下列链接仅在本地工作副本中存在。
 
-完整且详细的代码审计条目、复现机理与整改路线见文档 [`docs/audit-report.md`](./docs/audit-report.md)、[`docs/go-architecture-audit.md`](./docs/go-architecture-audit.md) 与 [`docs/remediation-plan.md`](./docs/remediation-plan.md)；对应的 Go 语言重构演进设计方案见 [`docs/go-migration-plan.md`](./docs/go-migration-plan.md)。
+完整且详细的代码审计条目、复现机理与整改路线见文档 [`docs/audit-report.md`](./docs/audit-report.md)、[`docs/go-architecture-audit.md`](./docs/go-architecture-audit.md) 与 [`docs/remediation-plan.md`](./docs/remediation-plan.md)；对应的 Go 语言重构演进设计方案见 [`docs/go-migration-plan.md`](./docs/go-migration-plan.md)；多凭据鉴权架构设计方案见 [`docs/auth-multi-credentials-design.md`](./docs/auth-multi-credentials-design.md)。
 
 Python 历史实现已于本次改动整体移除（`shell/*.py` 只存在于 git 历史），但下列历史缺陷正是上面「核心契约」的由来，维护时**不得回退**：
 

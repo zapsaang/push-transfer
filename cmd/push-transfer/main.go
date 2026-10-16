@@ -88,9 +88,6 @@ func run(ctx context.Context, args []string, stdout io.Writer, lookup func(strin
 		return fmt.Errorf("failed to load configuration: %w", err)
 	}
 
-	if cfg.Auth.HasPartialBasicAuth() {
-		logger.Warn("partial webhook basic auth configuration detected; both AUTH_USERNAME and AUTH_PASSWORD are required for basic auth")
-	}
 	if cfg.IMAP != nil && cfg.IMAP.HasPartialConfig() {
 		logger.Warn("partial IMAP trigger configuration detected; IMAP listener will not start unless all required fields are set")
 	}
@@ -104,9 +101,17 @@ func run(ctx context.Context, args []string, stdout io.Writer, lookup func(strin
 	// 4. Build delivery dispatcher and register all enabled targets
 	dispatcher := buildDispatcher(cfg, logger)
 
-	// 5. Evaluate run modes
-	startWebhook := !cfg.RunTrigger || cfg.Auth.HasWebhookAuth()
+	// 5. Evaluate run modes.
+	//
+	// The webhook is never served without credentials: an unauthenticated entry point is a
+	// misconfiguration, not a supported mode. The only way to run without AUTH_CREDENTIALS is
+	// IMAP-only mode (RUN_TRIGGER=true), which serves no HTTP at all.
+	startWebhook := cfg.Auth.HasWebhookAuth()
 	startIMAP := cfg.RunTrigger && cfg.IMAP.Enabled()
+
+	if !startWebhook && !cfg.RunTrigger {
+		return errors.New("no webhook credentials configured: set AUTH_CREDENTIALS, or set RUN_TRIGGER=true to run in IMAP-only mode without an HTTP endpoint")
+	}
 
 	if cfg.RunTrigger && !startIMAP {
 		logger.Warn("RUN_TRIGGER is enabled but IMAP is not configured; email trigger listener will not start")
@@ -117,7 +122,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, lookup func(strin
 	}
 
 	if !startWebhook {
-		logger.Warn("HTTP webhook endpoint is disabled because RUN_TRIGGER is enabled without webhook authentication; set AUTH_TOKEN or AUTH_USERNAME/AUTH_PASSWORD to serve it")
+		logger.Info("HTTP webhook endpoint is disabled because RUN_TRIGGER is enabled without webhook credentials; running in IMAP-only mode")
 	}
 
 	// 6. Setup root context and cancellation
@@ -170,10 +175,15 @@ func run(ctx context.Context, args []string, stdout io.Writer, lookup func(strin
 	// 8. Start HTTP Webhook server if enabled
 	var httpServer *http.Server
 	if startWebhook {
+		creds := cfg.Auth.Credentials
+		credNames := make([]string, len(creds))
+		for i, c := range creds {
+			credNames[i] = c.Name
+		}
+		logger.Info("configured webhook credentials", "count", len(creds), "names", credNames)
+
 		webhookHandler := webhook.NewHandler(webhook.HandlerOptions{
-			Token:          cfg.Auth.Token,
-			Username:       cfg.Auth.Username,
-			Password:       cfg.Auth.Password,
+			Credentials:    creds,
 			TrustedProxies: cfg.Server.TrustedProxies,
 			Processor:      pipe,
 			Deliverer:      dispatcher,
