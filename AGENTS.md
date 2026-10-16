@@ -114,12 +114,16 @@ go vet ./...              # 必须无输出
 go test -race -cover ./...
 ```
 
-#### CI 流水线
+#### CI 与镜像发布流水线
 
-单元测试与静态检查由 GitHub Actions 在每次 push 与 pull request 时自动执行，
-流水线定义见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，包含 gofmt/vet
-校验、`go test -race -cover` 与 `golangci-lint run`。**本地验证通过不等于 CI 通过**，
-合并前必须以 CI 绿色为准。
+- **单元测试与静态检查**：由 GitHub Actions 在每次 push 与 pull request 时自动执行，
+  流水线定义见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，包含 gofmt/vet
+  校验、`go test -race -cover` 与 `golangci-lint run`。**本地验证通过不等于 CI 通过**，
+  合并前必须以 CI 绿色为准。
+- **容器镜像发布**：由 GitHub Actions 在推送版本 Tag（`v*` 或 `[0-9]*`）时自动触发，
+  流水线定义见 [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml)。
+  支持 `linux/amd64` 与 `linux/arm64` 双架构构建，提取 semver 与 ref metadata 并附带
+  SBOM 与 build provenance 签名信息，多架构镜像自动发布至 GHCR (`ghcr.io/zapsaang/push-transfer`)。
 
 ---
 

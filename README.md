@@ -1,6 +1,7 @@
 # PushTransfer
 
 [![CI](https://github.com/zapsaang/push-transfer/actions/workflows/ci.yml/badge.svg)](https://github.com/zapsaang/push-transfer/actions/workflows/ci.yml)
+[![Release Image](https://github.com/zapsaang/push-transfer/actions/workflows/release-image.yml/badge.svg)](https://github.com/zapsaang/push-transfer/actions/workflows/release-image.yml)
 [![Go Version](https://img.shields.io/badge/Go-1.26.8+-00ADD8?style=flat&logo=go)](go.mod)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker)](https://www.docker.com/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -149,7 +150,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: push-transfer:latest
+    image: ghcr.io/zapsaang/push-transfer:latest
     container_name: push-transfer
     restart: unless-stopped
     ports:
