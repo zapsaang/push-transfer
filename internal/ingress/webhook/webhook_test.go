@@ -1172,6 +1172,7 @@ func TestWebhook_AppNotification_EndToEnd_ConcurrentDispatch(t *testing.T) {
 		},
 	}
 
+	expectedTimeStr := "通知时间：" + time.Unix(1700000000, 0).Format("2006-01-02 15:04:05")
 	targetEmail := &concurrentMockTarget{
 		name: "email",
 		onSend: func(msg *model.Message) {
@@ -1179,7 +1180,7 @@ func TestWebhook_AppNotification_EndToEnd_ConcurrentDispatch(t *testing.T) {
 				t.Errorf("email: expected AppName='招商银行' Title='紧急动账', got %q / %q", msg.AppName, msg.Title)
 			}
 			text := msg.GenComplexText()
-			if !strings.HasPrefix(text, "【招商银行】紧急动账\n\n") || !strings.Contains(text, "通知时间：2023-11-15 06:13:20") {
+			if !strings.HasPrefix(text, "【招商银行】紧急动账\n\n") || !strings.Contains(text, expectedTimeStr) {
 				t.Errorf("email: unexpected GenComplexText: %q", text)
 			}
 			msg.AppName = "MutatedInEmail"
