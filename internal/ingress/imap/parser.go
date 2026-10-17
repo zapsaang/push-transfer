@@ -135,5 +135,9 @@ func ParseEmail(r io.Reader) (*model.Message, bool, error) {
 		return nil, false, fmt.Errorf("failed to unmarshal JSON payload: %w", err)
 	}
 
+	if !msg.MsgType.Valid() {
+		return nil, false, fmt.Errorf("invalid or missing msg_type: %q", msg.MsgType)
+	}
+
 	return &msg, true, nil
 }

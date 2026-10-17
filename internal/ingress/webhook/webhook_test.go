@@ -5,16 +5,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/zapsaang/push-transfer/internal/config"
 	"github.com/zapsaang/push-transfer/internal/deliver"
 	"github.com/zapsaang/push-transfer/internal/ingress/webhook"
 	"github.com/zapsaang/push-transfer/internal/model"
+	"github.com/zapsaang/push-transfer/internal/pipeline"
 )
 
 func TestAuth_ConstantTimeCompare(t *testing.T) {
@@ -1000,4 +1005,254 @@ func TestWebhook_AuthorizedAuditLog(t *testing.T) {
 			t.Errorf("whitespace-only Name must not produce blank credential audit log, got:\n%s", logs)
 		}
 	})
+}
+
+func TestWebhook_StrictMsgTypeValidation(t *testing.T) {
+	const validToken = "valid-token-123"
+	h := webhook.NewHandler(webhook.HandlerOptions{
+		Credentials: []config.Credential{{Token: validToken}},
+		Processor:   &mockProcessor{pass: true},
+		Deliverer:   &mockDeliverer{},
+	})
+
+	testCases := []struct {
+		name         string
+		payload      string
+		expectedCode int
+		expectedMsg  string
+		checkBody    bool
+	}{
+		{
+			name:         "missing msg_type -> 400 Bad Request",
+			payload:      `{"title":"test","content":"hello"}`,
+			expectedCode: http.StatusBadRequest,
+			expectedMsg:  "invalid or missing msg_type",
+			checkBody:    true,
+		},
+		{
+			name:         "empty msg_type -> 400 Bad Request",
+			payload:      `{"msg_type":"","title":"test"}`,
+			expectedCode: http.StatusBadRequest,
+			expectedMsg:  "invalid or missing msg_type",
+			checkBody:    true,
+		},
+		{
+			name:         "whitespace msg_type -> 400 Bad Request",
+			payload:      `{"msg_type":"   ","title":"test"}`,
+			expectedCode: http.StatusBadRequest,
+			expectedMsg:  "invalid or missing msg_type",
+			checkBody:    true,
+		},
+		{
+			name:         "invalid msg_type -> 400 Bad Request",
+			payload:      `{"msg_type":"invalid_type","title":"test"}`,
+			expectedCode: http.StatusBadRequest,
+			expectedMsg:  "invalid or missing msg_type",
+			checkBody:    true,
+		},
+		{
+			name:         "legacy sms type -> 400 Bad Request",
+			payload:      `{"msg_type":"sms","title":"test"}`,
+			expectedCode: http.StatusBadRequest,
+			expectedMsg:  "invalid or missing msg_type",
+			checkBody:    true,
+		},
+		{
+			name:         "valid app_notification -> 200 OK",
+			payload:      `{"msg_type":"app_notification","app_name":"微信","title":"工作群","content":"开会"}`,
+			expectedCode: http.StatusOK,
+			checkBody:    false,
+		},
+		{
+			name:         "valid text -> 200 OK",
+			payload:      `{"msg_type":"text","title":"10086","content":"话费提醒"}`,
+			expectedCode: http.StatusOK,
+			checkBody:    false,
+		},
+		{
+			name:         "valid call -> 200 OK",
+			payload:      `{"msg_type":"call","title":"13800138000"}`,
+			expectedCode: http.StatusOK,
+			checkBody:    false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(tc.payload))
+			req.Header.Set("Authorization", "Bearer "+validToken)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != tc.expectedCode {
+				t.Fatalf("expected status %d, got %d: %s", tc.expectedCode, rec.Code, rec.Body.String())
+			}
+
+			if tc.checkBody {
+				var res map[string]string
+				if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+					t.Fatalf("failed to decode response JSON: %v", err)
+				}
+				if res["status"] != "failed" || res["message"] != tc.expectedMsg {
+					t.Fatalf("expected status 'failed' and message %q, got: %+v", tc.expectedMsg, res)
+				}
+			}
+		})
+	}
+}
+
+type concurrentMockTarget struct {
+	name      string
+	callCount int64
+	onSend    func(msg *model.Message)
+}
+
+func (m *concurrentMockTarget) Name() string { return m.name }
+func (m *concurrentMockTarget) Send(_ context.Context, msg *model.Message) error {
+	atomic.AddInt64(&m.callCount, 1)
+	if m.onSend != nil {
+		m.onSend(msg)
+	}
+	return nil
+}
+
+func TestWebhook_AppNotification_EndToEnd_ConcurrentDispatch(t *testing.T) {
+	rules := config.RulesConfig{
+		FilterWhite: []string{`(?i)重要`},
+		FilterBlack: []string{`(?i)垃圾`},
+		Captcha:     []string{`(?:验证码[:：为]?|code[:：])\s*(\d{4,6})`},
+		Emergency:   []string{`(?i)critical|紧急`},
+	}
+	p, err := pipeline.NewPipelineFromRules(rules, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to create pipeline: %v", err)
+	}
+
+	targetBark := &concurrentMockTarget{
+		name: "bark",
+		onSend: func(msg *model.Message) {
+			if msg.MsgType != model.MsgTypeAppNotification {
+				t.Errorf("bark: expected MsgTypeAppNotification, got %q", msg.MsgType)
+			}
+			if msg.AppName != "招商银行" {
+				t.Errorf("bark: expected AppName '招商银行', got %q", msg.AppName)
+			}
+			if msg.CaptchaCode != "889911" {
+				t.Errorf("bark: expected CaptchaCode '889911', got %q", msg.CaptchaCode)
+			}
+			if !msg.Emergency {
+				t.Errorf("bark: expected Emergency true, got %v", msg.Emergency)
+			}
+			if msg.BatteryLevel == nil || *msg.BatteryLevel != 95 {
+				t.Errorf("bark: expected BatteryLevel 95, got %v", msg.BatteryLevel)
+			}
+			// Attempt mutation to test clone isolation across all channels
+			msg.AppName = "MutatedInBark"
+			msg.Title = "MutatedTitleInBark"
+			if msg.BatteryLevel != nil {
+				*msg.BatteryLevel = 1
+			}
+		},
+	}
+
+	targetTG := &concurrentMockTarget{
+		name: "telegram",
+		onSend: func(msg *model.Message) {
+			if msg.AppName != "招商银行" {
+				t.Errorf("telegram: expected AppName '招商银行', got %q", msg.AppName)
+			}
+			text := msg.GenComplexText()
+			if !strings.HasPrefix(text, "【招商银行】紧急动账\n\n") || !strings.Contains(text, "当前电量: 95%") {
+				t.Errorf("telegram: unexpected GenComplexText: %q", text)
+			}
+			msg.AppName = "MutatedInTG"
+			if msg.BatteryLevel != nil {
+				*msg.BatteryLevel = 2
+			}
+		},
+	}
+
+	targetEmail := &concurrentMockTarget{
+		name: "email",
+		onSend: func(msg *model.Message) {
+			if msg.AppName != "招商银行" || msg.Title != "紧急动账" {
+				t.Errorf("email: expected AppName='招商银行' Title='紧急动账', got %q / %q", msg.AppName, msg.Title)
+			}
+			text := msg.GenComplexText()
+			if !strings.HasPrefix(text, "【招商银行】紧急动账\n\n") || !strings.Contains(text, "通知时间：2023-11-15 06:13:20") {
+				t.Errorf("email: unexpected GenComplexText: %q", text)
+			}
+			msg.AppName = "MutatedInEmail"
+		},
+	}
+
+	targetConsole := &concurrentMockTarget{
+		name: "console",
+		onSend: func(msg *model.Message) {
+			if msg.AppName != "招商银行" {
+				t.Errorf("console: expected AppName '招商银行', got %q", msg.AppName)
+			}
+			if msg.BatteryLevel == nil || *msg.BatteryLevel != 95 {
+				t.Errorf("console: expected isolated BatteryLevel 95, got %v", msg.BatteryLevel)
+			}
+			msg.AppName = "MutatedInConsole"
+		},
+	}
+
+	disp := deliver.NewDispatcher(deliver.DispatcherOptions{
+		Targets: []deliver.Target{targetBark, targetTG, targetEmail, targetConsole},
+		Timeout: 2 * time.Second,
+	})
+
+	const validToken = "concurrent-e2e-token"
+	h := webhook.NewHandler(webhook.HandlerOptions{
+		Credentials: []config.Credential{{Token: validToken}},
+		Processor:   p,
+		Deliverer:   disp,
+	})
+
+	const goroutines = 50
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			payload := fmt.Sprintf(`{
+				"msg_type": "app_notification",
+				"app_name": "招商银行",
+				"title": "紧急动账",
+				"content": "【银行】紧急提醒：您的验证码为 889911，请勿泄露。序列号：%d",
+				"battery_level": 95,
+				"timestamp": 1700000000000
+			}`, idx)
+
+			req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(payload))
+			req.Header.Set("Authorization", "Bearer "+validToken)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Errorf("routine %d: expected 200 OK, got %d: %s", idx, rec.Code, rec.Body.String())
+				return
+			}
+
+			var res map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+				t.Errorf("routine %d: json unmarshal failed: %v", idx, err)
+				return
+			}
+			if res["status"] != "success" {
+				t.Errorf("routine %d: expected status 'success', got %v", idx, res["status"])
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	for _, target := range []*concurrentMockTarget{targetBark, targetTG, targetEmail, targetConsole} {
+		if target.callCount != goroutines {
+			t.Fatalf("expected %d calls to %s target, got %d", goroutines, target.name, target.callCount)
+		}
+	}
 }

@@ -199,11 +199,31 @@ func TestParser_MIMEBodyExtraction(t *testing.T) {
 		if !ok {
 			t.Fatal("expected email to be processed")
 		}
-		if msg.MsgType != "call" {
-			t.Errorf("expected msg_type 'call', got %q", msg.MsgType)
+		if msg.MsgType != model.MsgTypeCall {
+			t.Errorf("expected msg_type %q, got %q", model.MsgTypeCall, msg.MsgType)
 		}
 		if msg.Title != "13800138000" {
 			t.Errorf("expected title '13800138000', got %q", msg.Title)
+		}
+	})
+
+	t.Run("app_notification plain email", func(t *testing.T) {
+		rawMsg := "Subject: PushTransfer Email Trigger\r\n" +
+			"Content-Type: text/plain; charset=utf-8\r\n\r\n" +
+			`{"msg_type":"app_notification","app_name":"钉钉","title":"审批提醒","content":"您有一条新的请假审批"}`
+
+		msg, ok, err := imap.ParseEmail(strings.NewReader(rawMsg))
+		if err != nil {
+			t.Fatalf("failed to parse app_notification email: %v", err)
+		}
+		if !ok {
+			t.Fatal("expected email to be processed")
+		}
+		if msg.MsgType != model.MsgTypeAppNotification {
+			t.Errorf("expected msg_type 'app_notification', got %q", msg.MsgType)
+		}
+		if msg.AppName != "钉钉" {
+			t.Errorf("expected app_name '钉钉', got %q", msg.AppName)
 		}
 	})
 }
@@ -309,6 +329,26 @@ func TestParseEmail_Errors(t *testing.T) {
 		_, _, err := imap.ParseEmail(strings.NewReader(raw))
 		if err == nil {
 			t.Log("parsed without error")
+		}
+	})
+
+	t.Run("missing msg_type in trigger email returns error", func(t *testing.T) {
+		raw := "Subject: PushTransfer Email Trigger\r\n" +
+			"Content-Type: text/plain\r\n\r\n" +
+			`{"title":"no msg_type"}`
+		_, _, err := imap.ParseEmail(strings.NewReader(raw))
+		if err == nil {
+			t.Fatal("expected error parsing email with missing msg_type, got nil")
+		}
+	})
+
+	t.Run("invalid msg_type in trigger email returns error", func(t *testing.T) {
+		raw := "Subject: PushTransfer Email Trigger\r\n" +
+			"Content-Type: text/plain\r\n\r\n" +
+			`{"msg_type":"invalid_type","title":"bad"}`
+		_, _, err := imap.ParseEmail(strings.NewReader(raw))
+		if err == nil {
+			t.Fatal("expected error parsing email with invalid msg_type, got nil")
 		}
 	})
 }
@@ -894,6 +934,138 @@ func TestListener_ConsumptionSemanticsAndRetry(t *testing.T) {
 		mu.Unlock()
 		if !seen {
 			t.Error("expected malformed poison email UID 3002 to be marked SEEN immediately")
+		}
+		if !strings.Contains(logBuf.String(), "discarding malformed trigger email (poison pill)") {
+			t.Errorf("expected poison pill error log, got logs: %s", logBuf.String())
+		}
+	})
+
+	t.Run("trigger email with missing or invalid msg_type is marked SEEN immediately as poison pill", func(t *testing.T) {
+		clientConn, serverConn := net.Pipe()
+		defer func() { _ = clientConn.Close() }()
+		defer func() { _ = serverConn.Close() }()
+
+		var (
+			mu            sync.Mutex
+			uid3005Seen   bool
+			handlerCalled int32
+			storeDone     = make(chan struct{})
+		)
+
+		const invalidMsgTypeEmail = "Subject: PushTransfer Email Trigger\r\n" +
+			"Content-Type: text/plain; charset=utf-8\r\n\r\n" +
+			`{"title":"no_type","content":"missing msg_type"}`
+
+		go func() {
+			r := bufio.NewReader(serverConn)
+			w := bufio.NewWriter(serverConn)
+			writeLine := func(s string) {
+				_, _ = w.WriteString(s)
+				_ = w.Flush()
+			}
+
+			writeLine("* OK [CAPABILITY IMAP4rev1 IDLE] Mock IMAP Server Ready\r\n")
+
+			for {
+				line, err := r.ReadString('\n')
+				if err != nil {
+					return
+				}
+				line = strings.TrimRight(line, "\r\n")
+				parts := strings.SplitN(line, " ", 2)
+				if len(parts) < 2 {
+					continue
+				}
+				tag := parts[0]
+				cmd := parts[1]
+				upperCmd := strings.ToUpper(cmd)
+
+				switch {
+				case strings.HasPrefix(upperCmd, "CAPABILITY"):
+					writeLine("* CAPABILITY IMAP4rev1 IDLE\r\n" + tag + " OK CAPABILITY completed\r\n")
+				case strings.HasPrefix(upperCmd, "LOGIN"):
+					writeLine(tag + " OK LOGIN completed\r\n")
+				case strings.HasPrefix(upperCmd, "SELECT"):
+					writeLine("* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] UIDs valid\r\n* FLAGS (\\Seen)\r\n* OK [PERMANENTFLAGS (\\Seen)] Flags permitted\r\n" + tag + " OK [READ-WRITE] SELECT completed\r\n")
+				case strings.HasPrefix(upperCmd, "UID SEARCH"):
+					mu.Lock()
+					seen := uid3005Seen
+					mu.Unlock()
+					if !seen {
+						writeLine("* SEARCH 3005\r\n" + tag + " OK UID SEARCH completed\r\n")
+					} else {
+						writeLine("* SEARCH\r\n" + tag + " OK UID SEARCH completed\r\n")
+					}
+				case strings.HasPrefix(upperCmd, "UID FETCH"):
+					fetchResp := fmt.Sprintf("* 1 FETCH (UID 3005 BODY[] {%d}\r\n%s)\r\n%s OK UID FETCH completed\r\n",
+						len(invalidMsgTypeEmail), invalidMsgTypeEmail, tag)
+					writeLine(fetchResp)
+				case strings.HasPrefix(upperCmd, "UID STORE"):
+					mu.Lock()
+					uid3005Seen = true
+					mu.Unlock()
+					writeLine(tag + " OK UID STORE completed\r\n")
+					select {
+					case <-storeDone:
+					default:
+						close(storeDone)
+					}
+				case strings.HasPrefix(upperCmd, "IDLE"):
+					writeLine("+ idling\r\n")
+					doneLine, errDone := r.ReadString('\n')
+					if errDone != nil {
+						return
+					}
+					if strings.TrimRight(doneLine, "\r\n") == "DONE" {
+						writeLine(tag + " OK IDLE completed\r\n")
+					}
+				case strings.HasPrefix(upperCmd, "LOGOUT"):
+					writeLine("* BYE Logging out\r\n" + tag + " OK LOGOUT completed\r\n")
+					return
+				}
+			}
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+		listener := imap.NewListener(imap.ListenerOptions{
+			IMAPServer: "127.0.0.1",
+			IMAPPort:   9993,
+			LoginEmail: "test@example.com",
+			Password:   "secret",
+			Logger:     logger,
+			DialConn: func(_ context.Context, _ string) (net.Conn, error) {
+				return clientConn, nil
+			},
+			Handler: func(_ context.Context, _ *model.Message) error {
+				atomic.AddInt32(&handlerCalled, 1)
+				return nil
+			},
+		})
+
+		go func() {
+			select {
+			case <-storeDone:
+				time.Sleep(10 * time.Millisecond)
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+
+		_ = listener.Start(ctx)
+
+		if got := atomic.LoadInt32(&handlerCalled); got != 0 {
+			t.Errorf("expected handler not to be called for invalid msg_type poison email, got %d", got)
+		}
+		mu.Lock()
+		seen := uid3005Seen
+		mu.Unlock()
+		if !seen {
+			t.Error("expected invalid msg_type poison email UID 3005 to be marked SEEN immediately")
 		}
 		if !strings.Contains(logBuf.String(), "discarding malformed trigger email (poison pill)") {
 			t.Errorf("expected poison pill error log, got logs: %s", logBuf.String())

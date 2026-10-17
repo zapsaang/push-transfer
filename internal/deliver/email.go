@@ -90,12 +90,25 @@ func (e *EmailDeliver) Send(ctx context.Context, msg *model.Message) error {
 
 	var subject string
 	switch msg.MsgType {
-	case "call":
-		subject = fmt.Sprintf("New Call From %s", msg.Title)
-	case "text":
-		subject = fmt.Sprintf("New Message From %s", msg.Title)
+	case model.MsgTypeCall:
+		subject = fmt.Sprintf("New Call From %s", strings.TrimSpace(msg.Title))
+	case model.MsgTypeText:
+		subject = fmt.Sprintf("New Message From %s", strings.TrimSpace(msg.Title))
+	case model.MsgTypeAppNotification:
+		appName := strings.TrimSpace(msg.AppName)
+		title := strings.TrimSpace(msg.Title)
+		switch {
+		case appName != "" && title != "":
+			subject = fmt.Sprintf("[%s] %s", appName, title)
+		case appName != "":
+			subject = fmt.Sprintf("[%s] New Notification", appName)
+		case title != "":
+			subject = fmt.Sprintf("New Notification From %s", title)
+		default:
+			subject = "New Notification"
+		}
 	default:
-		subject = msg.Title
+		subject = strings.TrimSpace(msg.Title)
 	}
 
 	sender := sanitizeHeaderValue(e.senderEmail)

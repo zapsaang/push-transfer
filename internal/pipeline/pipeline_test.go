@@ -287,7 +287,7 @@ func TestPipelineExecution(t *testing.T) {
 
 	// 1. Text message with full pipeline matching
 	textMsg := &model.Message{
-		MsgType: "text",
+		MsgType: model.MsgTypeText,
 		Title:   "Service",
 		Content: "URGENT notice: code: 123456",
 	}
@@ -307,7 +307,7 @@ func TestPipelineExecution(t *testing.T) {
 
 	// 2. Blocked text message
 	blockedMsg := &model.Message{
-		MsgType: "text",
+		MsgType: model.MsgTypeText,
 		Title:   "Spam",
 		Content: "Huge Marketing discount today! code: 999999",
 	}
@@ -325,7 +325,7 @@ func TestPipelineExecution(t *testing.T) {
 
 	// 3. Call message passes through directly without filtering
 	callMsg := &model.Message{
-		MsgType: "call",
+		MsgType: model.MsgTypeCall,
 		Title:   "10086",
 		Content: "Marketing robocall", // even with blacklist word
 	}
@@ -492,15 +492,17 @@ func TestPipelineEdgeCases(t *testing.T) {
 		t.Fatalf("expected pass=true, err=nil for nil msg, got pass=%v, err=%v", pass, err)
 	}
 
-	// Unknown msg_type passes through
-	unknownMsg := &model.Message{MsgType: "unknown", Content: "something"}
-	pass, err = pipeline.Process(unknownMsg)
-	if err != nil || !pass {
-		t.Fatalf("expected pass=true for unknown msg type")
+	// Unknown or empty msg_type fails closed (ADR-05)
+	for _, invalidType := range []model.MsgType{"unknown", "", "   "} {
+		unknownMsg := &model.Message{MsgType: invalidType, Content: "something"}
+		pass, err = pipeline.Process(unknownMsg)
+		if err == nil || pass {
+			t.Fatalf("expected pass=false, err!=nil for msg type %q, got pass=%v, err=%v", invalidType, pass, err)
+		}
 	}
 
 	// Execute alias
-	pass, err = pipeline.Execute(&model.Message{MsgType: "call"})
+	pass, err = pipeline.Execute(&model.Message{MsgType: model.MsgTypeCall})
 	if err != nil || !pass {
 		t.Fatalf("expected pass=true from Execute alias")
 	}
@@ -508,7 +510,7 @@ func TestPipelineEdgeCases(t *testing.T) {
 	// Error in filter strategy during pipeline execution
 	failingFilter, _ := NewFilterStrategy(nil, []string{"(a+)+$"}, 50*time.Millisecond)
 	pWithFail := NewPipeline(failingFilter, nil, nil)
-	_, err = pWithFail.Process(&model.Message{MsgType: "text", Content: "aaaaaaaaaaaaaaaaaaaaaaaaaaaa!"})
+	_, err = pWithFail.Process(&model.Message{MsgType: model.MsgTypeText, Content: "aaaaaaaaaaaaaaaaaaaaaaaaaaaa!"})
 	if err == nil {
 		t.Fatal("expected pipeline to return error when filter strategy fails")
 	}
@@ -517,7 +519,7 @@ func TestPipelineEdgeCases(t *testing.T) {
 	failingCaptcha, _ := NewCaptchaStrategy([]string{"(a+)+$"}, 50*time.Millisecond)
 	failingEmergency, _ := NewEmergencyStrategy([]string{"(a+)+$"}, 50*time.Millisecond)
 	pWithWarn := NewPipeline(nil, failingCaptcha, failingEmergency)
-	pass, err = pWithWarn.Process(&model.Message{MsgType: "text", Content: "aaaaaaaaaaaaaaaaaaaaaaaaaaaa!"})
+	pass, err = pWithWarn.Process(&model.Message{MsgType: model.MsgTypeText, Content: "aaaaaaaaaaaaaaaaaaaaaaaaaaaa!"})
 	if err != nil || !pass {
 		t.Fatalf("expected pipeline to pass even if captcha/emergency fail with warning, got pass=%v, err=%v", pass, err)
 	}
@@ -536,7 +538,7 @@ func TestPipeline_CustomLoggerInjection(t *testing.T) {
 	}
 
 	pass, err := p.Process(&model.Message{
-		MsgType: "text",
+		MsgType: model.MsgTypeText,
 		Title:   "CustomLogSpam",
 		Content: "this is spam message",
 	})
@@ -546,5 +548,94 @@ func TestPipeline_CustomLoggerInjection(t *testing.T) {
 
 	if !strings.Contains(buf.String(), "pipeline: message rejected by filter strategy") || !strings.Contains(buf.String(), "CustomLogSpam") {
 		t.Fatalf("expected custom logger buffer to receive pipeline rejection log, got: %q", buf.String())
+	}
+}
+
+func TestPipeline_AppNotification_FilteringAndBypass(t *testing.T) {
+	rules := config.RulesConfig{
+		FilterWhite: []string{`(?i)重要`},
+		FilterBlack: []string{`(?i)广告`, `推广`},
+	}
+	p, err := NewPipelineFromRules(rules, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("unexpected error creating pipeline: %v", err)
+	}
+
+	// 1. Message A: Whitelist bypasses blacklist
+	msgA := &model.Message{
+		MsgType: model.MsgTypeAppNotification,
+		AppName: "企业微信",
+		Title:   "工作通知",
+		Content: "重要通知: 您的广告已被审核通过",
+	}
+	pass, err := p.Process(msgA)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !pass {
+		t.Fatal("expected whitelist to pass message A, but it was blocked")
+	}
+
+	// 2. Message B: Blacklist blocks
+	msgB := &model.Message{
+		MsgType: model.MsgTypeAppNotification,
+		AppName: "淘宝",
+		Title:   "促销活动",
+		Content: "最新推广优惠",
+	}
+	pass, err = p.Process(msgB)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pass {
+		t.Fatal("expected blacklist to block message B, but it was passed")
+	}
+
+	// 3. Message C: Unknown or empty message type fails closed with error
+	for _, badType := range []model.MsgType{"unknown", ""} {
+		msgC := &model.Message{
+			MsgType: badType,
+			Title:   "测试",
+			Content: "合法内容",
+		}
+		pass, err = p.Process(msgC)
+		if err == nil {
+			t.Fatalf("expected message type %q to return error (fail-closed), got nil", badType)
+		}
+		if pass {
+			t.Fatalf("expected message type %q to fail (pass=false), got true", badType)
+		}
+	}
+}
+
+func TestPipeline_AppNotification_CaptchaAndEmergencyEnrichment(t *testing.T) {
+	rules := config.RulesConfig{
+		Captcha:   []string{`(?:验证码[:：为]?|code[:：])\s*(\d{4,6})`},
+		Emergency: []string{`(?i)critical|紧急`},
+	}
+	p, err := NewPipelineFromRules(rules, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	msg := &model.Message{
+		MsgType: model.MsgTypeAppNotification,
+		AppName: "招商银行",
+		Title:   "动账通知",
+		Content: "【银行】紧急提醒：您的验证码为 889911，请勿泄露。",
+	}
+
+	pass, err := p.Process(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !pass {
+		t.Fatal("expected message to pass pipeline")
+	}
+	if msg.CaptchaCode != "889911" {
+		t.Fatalf("expected CaptchaCode '889911', got %q", msg.CaptchaCode)
+	}
+	if !msg.Emergency {
+		t.Fatal("expected Emergency=true, got false")
 	}
 }

@@ -481,6 +481,50 @@ func TestRun_FullE2E_WebhookFlow(t *testing.T) {
 		}
 	}
 
+	// 8.5 Invalid or missing msg_type -> assert HTTP 400 Bad Request
+	{
+		body := `{"msg_type":"invalid_type","title":"bad"}`
+		resp, res := postWebhook(body, authToken)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("expected 400 with invalid msg_type, got %d", resp.StatusCode)
+		}
+		if res["status"] != "failed" || res["message"] != "invalid or missing msg_type" {
+			t.Errorf("expected failed status with 'invalid or missing msg_type', got: %v", res)
+		}
+	}
+
+	// 8.6 App notification delivery -> assert group = app_name, title = [app_name] title, and Telegram text
+	{
+		body := `{"msg_type":"app_notification","app_name":"企业微信","title":"项目汇报","content":"代码重构已通过验证"}`
+		resp, res := postWebhook(body, authToken)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("app notification message: expected 200, got %d", resp.StatusCode)
+		}
+		if res["status"] != "success" {
+			t.Errorf("app notification message: expected status success, got %v", res["status"])
+		}
+
+		barkMu.Lock()
+		lastBark := barkPayloads[len(barkPayloads)-1]
+		barkMu.Unlock()
+
+		if lastBark["group"] != "企业微信" {
+			t.Errorf("Bark group mismatch: expected '企业微信', got %v", lastBark["group"])
+		}
+		if lastBark["title"] != "[企业微信] 项目汇报" {
+			t.Errorf("Bark title mismatch: expected '[企业微信] 项目汇报', got %v", lastBark["title"])
+		}
+
+		tgMu.Lock()
+		lastTG := tgPayloads[len(tgPayloads)-1]
+		tgMu.Unlock()
+
+		tgText, _ := lastTG["text"].(string)
+		if !strings.Contains(tgText, "【企业微信】项目汇报") || !strings.Contains(tgText, "代码重构已通过验证") {
+			t.Errorf("Telegram app_notification text mismatch: %s", tgText)
+		}
+	}
+
 	// 9. Downstreams all failing -> assert HTTP 502 {"status":"deliver_failed"}
 	{
 		atomic.StoreInt32(&barkFailing, 1)
@@ -680,7 +724,7 @@ func TestCallMessageFlow(t *testing.T) {
 	}
 
 	callMsg := &model.Message{
-		MsgType: "call",
+		MsgType: model.MsgTypeCall,
 		Title:   "13800138000",
 		Content: "missed call",
 	}

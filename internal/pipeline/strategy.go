@@ -2,6 +2,7 @@
 package pipeline
 
 import (
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -14,8 +15,8 @@ type Strategy interface {
 	Process(msg *model.Message) (bool, error)
 }
 
-// Pipeline coordinates message processing stages based on msg.MsgType, keeping
-// the historical per-type strategy chain of the removed Python implementation.
+// Pipeline coordinates message processing stages based on msg.MsgType, enforcing
+// Fail-Closed rejection for unsupported or empty message types.
 type Pipeline struct {
 	filter    Strategy
 	captcha   Strategy
@@ -60,20 +61,21 @@ func NewPipelineFromRules(rules config.RulesConfig, timeout time.Duration, logge
 }
 
 // Process runs the strategies mapped to the message type.
-// - "call": bypasses strategies and passes through unconditionally.
-// - "text" (and empty/default): runs filter -> captcha -> emergency.
+// - MsgTypeCall: bypasses strategies and passes through unconditionally.
+// - MsgTypeText, MsgTypeAppNotification: runs filter -> captcha -> emergency.
 // If filter blocks the message, it returns (false, nil) immediately.
+// Any other unhandled message type is rejected with an error (Fail-Closed).
 func (p *Pipeline) Process(msg *model.Message) (bool, error) {
 	if msg == nil {
 		return true, nil
 	}
 
 	switch msg.MsgType {
-	case "call":
-		// Calls carry no content to filter: the legacy chain for "call" was empty.
+	case model.MsgTypeCall:
+		// Calls carry no content to filter: the chain for "call" is empty.
 		return true, nil
 
-	case "text", "":
+	case model.MsgTypeText, model.MsgTypeAppNotification:
 		// 1. Filter strategy (blocking stage)
 		if p.filter != nil {
 			pass, err := p.filter.Process(msg)
@@ -106,8 +108,9 @@ func (p *Pipeline) Process(msg *model.Message) (bool, error) {
 		return true, nil
 
 	default:
-		// For unhandled message types, pass through
-		return true, nil
+		// Fail-Closed: unhandled message types are rejected with error (ADR-05)
+		p.logger.Warn("pipeline: unhandled message type rejected", "msg_type", string(msg.MsgType))
+		return false, fmt.Errorf("unsupported message type: %s", msg.MsgType)
 	}
 }
 

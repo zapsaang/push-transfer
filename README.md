@@ -8,7 +8,7 @@
 
 `PushTransfer` 是一个面向个人与自建场景的**现代化、轻量级、高性能通知中转与过滤网关**（基于 Go 语言实现）。
 
-它可以接收来自 Android 设备（如 [SmsForwarder 短信转发器](https://github.com/pppscn/SmsForwarder)）上报的短信、未接来电，或监听 IMAP 邮箱的触发邮件。消息在经过白名单放行、黑名单过滤、验证码提取与紧急呼叫标记等策略流水线后，并发分发至 **Bark (iOS APNs)**、**Telegram Bot**、**邮件 (SMTP SSL)** 以及控制台。
+它可以接收来自 Android 设备（如 [SmsForwarder 短信转发器](https://github.com/pppscn/SmsForwarder)）上报的应用通知、短信、未接来电，或监听 IMAP 邮箱的触发邮件。消息在经过白名单放行、黑名单过滤、验证码提取与紧急呼叫标记等策略流水线后，并发分发至 **Bark (iOS APNs)**、**Telegram Bot**、**邮件 (SMTP SSL)** 以及控制台。
 
 ---
 
@@ -73,7 +73,7 @@ flowchart TD
 
 - **高效轻量**：纯 Go 原生实现，构建为静态单一二进制文件，无外部动态链接依赖，容器镜像体积小（基于 Alpine），运行时内存占用低。
 - **多渠道并发投递**：
-  - **Bark (iOS)**：支持多设备 Key、自定义推送服务器、关键警告（`critical` 级别强提醒音量）、自动复制验证码（`autoCopy`），以及基于 AES-128-CBC 每消息动态随机 IV 的端到端密文推送（`ciphertext` 与 `iv` 两个独立参数，完全对齐 Bark 官方密文协议）。
+  - **Bark (iOS)**：支持应用通知按 App 智能折叠分组（`group` 映射 iOS APNs `thread-id`）、多设备 Key、自定义推送服务器、关键警告（`critical` 级别强提醒音量）、自动复制验证码（`autoCopy`），以及基于 AES-128-CBC 每消息动态随机 IV 的端到端密文推送（`ciphertext` 与 `iv` 两个独立参数，完全对齐 Bark 官方密文协议）。
   - **Telegram Bot**：支持自定义反向代理 API 地址、HTML 排版富文本渲染、实体标签防截断安全清洗与超长文本防御。
   - **SMTP 邮件**：支持 SSL/TLS 直连、RFC 2047 标题编码清洗与 CRLF 注入防护。
   - **Console 回显**：无外部分发目标时自动回退为控制台输出，便于本地调试。
@@ -129,7 +129,7 @@ curl -X POST http://localhost:8889/webhook \
 ```text
 time=2026-10-16T20:53:36.606+08:00 level=INFO msg="incoming request" ip=127.0.0.1 method=POST path=/webhook
 time=2026-10-16T20:53:36.606+08:00 level=INFO msg="webhook authorized" ip=127.0.0.1 credential=dev
-time=2026-10-16T20:53:36.606+08:00 level=INFO msg="console deliver" msg_type=text title=10086 content="【中国移动】您的验证码是 889900，请勿泄露给他人。" captcha="" emergency=false text="【中国移动】您的验证码是 889900，请勿泄露给他人。\n\n短信来自: 10086\n\n发送时间：2024-10-15 21:46:40\n转发时间：2024-10-15 21:46:40\n"
+time=2026-10-16T20:53:36.606+08:00 level=INFO msg="console deliver" msg_type=text app_name="" title=10086 content="【中国移动】您的验证码是 889900，请勿泄露给他人。" captcha="" emergency=false text="【中国移动】您的验证码是 889900，请勿泄露给他人。\n\n短信来自: 10086\n\n发送时间：2024-10-15 21:46:40\n转发时间：2024-10-15 21:46:40\n"
 ```
 
 > - `RUN_MODE` 必填，未设置或非法值 fail-fast，不会猜测模式。
@@ -411,13 +411,16 @@ Authorization: Bearer <你的 token>   # AUTH_CREDENTIALS 中某个条目的 tok
 
 | 字段 | 类型 | 是否必填 | 说明 |
 |------|------|----------|------|
-| `msg_type` | string | 是 | 消息类型：`text`（短信，走规则流水线）或 `call`（来电，无条件放行） |
-| `title` | string | 是 | 标题或消息来源（如发件人号码、来电人姓名/号码） |
-| `content` | string | 否 | 短信正文内容（`call` 类型可为空） |
+| `msg_type` | string | 是 | 消息类型：`app_notification`（应用通知，走流水线并按应用智能折叠）、`text`（短信，走流水线）或 `call`（来电，无条件放行）。严格必填，若缺失或未定义直接返回 400 |
+| `app_name` | string | 否 | 来源应用名称（如 `"微信"`、`"钉钉"`、`"Google Authenticator"`，仅 `app_notification` 使用，用于 Bark 折叠分组与全渠道排版） |
+| `title` | string | 否 | 标题或消息来源（如发件人号码、群聊名称、来电人姓名/号码） |
+| `content` | string | 否 | 通知或短信正文内容（`call` 类型可为空） |
 | `battery_level` | int | 否 | 发送端设备当前剩余电量百分比（如 `85`） |
-| `timestamp` | int/str | 否 | 时间戳。系统具备防御性容错，自动兼容毫秒（13位）、秒（10位）、字符串数字或 `null` |
+| `timestamp` | int/str | 否 | 通用时间戳。系统具备防御性容错，自动兼容毫秒（13位）、秒（10位）、字符串数字或 `null` |
 | `send_time` | int/str | 否 | 消息实际发送时间戳（备选回退字段） |
 | `receive_time` | int/str | 否 | 转发端设备接收时间戳（备选回退字段） |
+| `transmit_time` | int/str | 否 | 转发端设备转发时间戳（备选回退字段） |
+| `incoming_time` | int/str | 否 | 来电或通知到达时间戳（备选回退字段） |
 
 #### 接口响应状态码
 
@@ -425,12 +428,28 @@ Authorization: Bearer <你的 token>   # AUTH_CREDENTIALS 中某个条目的 tok
 |-----------|------------|----------|
 | `200 OK` | `{"status":"success"}` | 消息处理并通过流水线，已成功投递下游 |
 | `200 OK` | `{"status":"blocked"}` | 消息命中黑名单规则，已被网关正常拦截过滤 |
+| `400 Bad Request` | `{"status":"failed","message":"invalid or missing msg_type"}` | 消息类型缺失、为空或未定义（严格 Fail-Fast，杜绝隐式默认） |
 | `400 Bad Request` | `{"status":"failed","message":"invalid json"}` | 报文不是合法的 JSON 格式 |
 | `401 Unauthorized`| `{"status":"failed","message":"unauthorized"}` | Bearer Token / Basic Auth 认证失败（配置 Basic Auth 时附带 `WWW-Authenticate: Basic` 质询；多凭据下响应不区分具体失败凭据以避免枚举） |
 | `405 Method Not Allowed` | `{"status":"failed","message":"method not allowed"}` | 请求方法不为 `POST` |
 | `413 Request Entity Too Large` | `{"status":"failed","message":"request body too large"}` | 请求体体积超过 1MB 上限 |
 | `500 Internal Server Error` | `{"status":"failed","message":"process failed"}` | 规则流水线执行失败（如正则匹配超时熔断） |
 | `502 Bad Gateway` | `{"status":"deliver_failed","message":"..."}` | 下游所有投递通道均请求失败 |
+
+#### 消息类型、Bark 分组折叠与多渠道排版规则
+
+- **Bark 智能分组 (`group` → iOS APNs `thread-id`)**：
+  - `msg_type = "text"`：`group = "text"`
+  - `msg_type = "call"`：`group = "call"`
+  - `msg_type = "app_notification"`：若 `app_name` 非空（去除首尾空白后）则 `group = app_name`（使同一 App 的通知在 iOS 通知中心自动聚合折叠）；若 `app_name` 为空或纯空白则降级为 `group = "app_notification"`。
+- **`app_notification` 四态标题与正文排版矩阵**（`app_name` 与 `title` 均自动 `TrimSpace`）：
+
+| 场景状态 | Bark 通知标题 (`title`) | 邮件主题 (`Subject`) | Telegram / 邮件 / 控制台综合文本首行 |
+|----------|-------------------------|----------------------|--------------------------------------|
+| `app_name` 与 `title` 均非空 | `[app_name] title` | `[app_name] title` | `【app_name】title` |
+| 仅 `app_name` 非空 | `[app_name]` | `[app_name] New Notification` | `【app_name】` |
+| 仅 `title` 非空 | `New Notification From title` | `New Notification From title` | `【应用通知】title` |
+| `app_name` 与 `title` 均为空 | `New Notification` | `New Notification` | `【应用通知】` |
 
 ---
 
@@ -488,7 +507,19 @@ AUTH_CREDENTIALS='[{"name":"phone-a","token":"random-token-1"},{"name":"tablet",
        "battery_level": [battery]
      }
      ```
-3. 来电转发通道请求体模板：
+3. **应用通知转发通道请求体模板**：
+   在 SmsForwarder 的 **应用通知转发规则** 中配置专用请求体（支持按 App 聚合折叠与规则过滤）：
+   ```json
+   {
+     "msg_type": "app_notification",
+     "app_name": "[app_name]",
+     "title": "[title]",
+     "content": "[msg]",
+     "timestamp": "[timestamp]",
+     "battery_level": [battery]
+   }
+   ```
+4. **来电转发通道请求体模板**：
    ```json
    {
      "msg_type": "call",
@@ -498,7 +529,7 @@ AUTH_CREDENTIALS='[{"name":"phone-a","token":"random-token-1"},{"name":"tablet",
      "battery_level": [battery]
    }
    ```
-4. 点击 **测试**，验证能否收到推送。
+5. 点击 **测试**，验证能否收到推送。
 
 ---
 
@@ -518,7 +549,7 @@ AUTH_CREDENTIALS='[{"name":"phone-a","token":"random-token-1"},{"name":"tablet",
 2. 任何需要触发推送的客户端，只需向 `EMAIL_TRIGGER_LOGIN_EMAIL` 发送一封邮件：
    - **邮件主题 (Subject)**：必须为 `PushTransfer Email Trigger`（大小写敏感）。
    - **邮件正文 (Body)**：内容为标准 JSON 字符串（格式同 Webhook 请求报文），且邮件为 `text/plain` 纯文本格式。
-3. 消费语义：投递成功后自动将该邮件标记为已读（`\Seen`）；投递失败时保持未读并在同一会话内指数退避重试；主题匹配但正文/JSON 永久损坏的毒丸邮件会被标记 `\Seen` 以隔离死信。**主题不匹配的普通邮件不会被修改**（保持原有未读状态）。因此建议为该触发器使用专用邮箱。
+3. 消费语义：投递成功后自动将该邮件标记为已读（`\Seen`）；投递失败时保持未读并在同一会话内指数退避重试；主题匹配但正文/JSON 永久损坏或 `msg_type` 缺失/非法的毒丸邮件会被立即标记 `\Seen` 以隔离死信。**主题不匹配的普通邮件不会被修改**（保持原有未读状态）。因此建议为该触发器使用专用邮箱。
 
 ---
 

@@ -278,6 +278,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate msg_type: fail-fast on missing or invalid msg_type (ADR-05)
+	if !msg.MsgType.Valid() {
+		h.logger.Warn("webhook invalid or missing msg_type", "ip", clientIP, "msg_type", string(msg.MsgType))
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"status":  "failed",
+			"message": "invalid or missing msg_type",
+		})
+		return
+	}
+
 	// 3. Pipeline Processing
 	if h.processor != nil {
 		pass, err := h.processor.Process(&msg)

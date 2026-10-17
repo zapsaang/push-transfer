@@ -38,7 +38,8 @@ func (c *ConsoleDeliver) Send(_ context.Context, msg *model.Message) error {
 		l = slog.Default()
 	}
 	l.Info("console deliver",
-		"msg_type", msg.MsgType,
+		"msg_type", string(msg.MsgType),
+		"app_name", msg.AppName,
 		"title", msg.Title,
 		"content", msg.Content,
 		"captcha", msg.CaptchaCode,

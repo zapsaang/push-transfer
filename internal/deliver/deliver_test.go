@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -44,7 +45,7 @@ func TestBarkDeliver(t *testing.T) {
 		})
 
 		msg := &model.Message{
-			MsgType:     "text",
+			MsgType:     model.MsgTypeText,
 			Title:       "10086",
 			Content:     "Your code is 123456",
 			CaptchaCode: "123456",
@@ -61,6 +62,9 @@ func TestBarkDeliver(t *testing.T) {
 
 		if receivedBody["title"] != "New Message From 10086" {
 			t.Errorf("expected title 'New Message From 10086', got %v", receivedBody["title"])
+		}
+		if receivedBody["group"] != "text" {
+			t.Errorf("expected group 'text', got %v", receivedBody["group"])
 		}
 		if receivedBody["body"] != "Your code is 123456" {
 			t.Errorf("expected body 'Your code is 123456', got %v", receivedBody["body"])
@@ -104,7 +108,7 @@ func TestBarkDeliver(t *testing.T) {
 		})
 
 		msg := &model.Message{
-			MsgType: "call",
+			MsgType: model.MsgTypeCall,
 			Title:   "13800138000",
 		}
 
@@ -118,6 +122,9 @@ func TestBarkDeliver(t *testing.T) {
 
 		if receivedBody["title"] != "New Call From 13800138000" {
 			t.Errorf("expected title 'New Call From 13800138000', got %v", receivedBody["title"])
+		}
+		if receivedBody["group"] != "call" {
+			t.Errorf("expected group 'call', got %v", receivedBody["group"])
 		}
 		if receivedBody["copy"] != "13800138000" {
 			t.Errorf("expected copy '13800138000', got %v", receivedBody["copy"])
@@ -147,7 +154,7 @@ func TestBarkDeliver(t *testing.T) {
 		})
 
 		msg := &model.Message{
-			MsgType: "call",
+			MsgType: model.MsgTypeCall,
 			Title:   "13800138000",
 			Content: "Missed 3 times",
 		}
@@ -186,7 +193,7 @@ func TestBarkDeliver(t *testing.T) {
 		})
 
 		msg := &model.Message{
-			MsgType:     "text",
+			MsgType:     model.MsgTypeText,
 			Title:       "SecretBank",
 			Content:     "Your secret is safe",
 			CaptchaCode: "8888",
@@ -229,6 +236,9 @@ func TestBarkDeliver(t *testing.T) {
 		if innerPayload["title"] != "New Message From SecretBank" {
 			t.Errorf("decrypted title mismatch: %v", innerPayload["title"])
 		}
+		if innerPayload["group"] != "text" {
+			t.Errorf("decrypted group mismatch: %v", innerPayload["group"])
+		}
 		if innerPayload["body"] != "Your secret is safe" {
 			t.Errorf("decrypted body mismatch: %v", innerPayload["body"])
 		}
@@ -264,7 +274,7 @@ func TestTelegramDeliver(t *testing.T) {
 
 	battery := 85
 	msg := &model.Message{
-		MsgType:      "text",
+		MsgType:      model.MsgTypeText,
 		Title:        "<Bank & Co>",
 		Content:      "Alert: balance < $100 & > $50",
 		BatteryLevel: &battery,
@@ -301,7 +311,7 @@ func TestTelegramDeliver(t *testing.T) {
 	t.Run("excessively long text is truncated safely", func(t *testing.T) {
 		longContent := strings.Repeat("长消息内容ABC123", 500) // ~5500 runes
 		longMsg := &model.Message{
-			MsgType: "text",
+			MsgType: model.MsgTypeText,
 			Title:   "LongSender",
 			Content: longContent,
 		}
@@ -329,7 +339,7 @@ func TestTelegramDeliver(t *testing.T) {
 		// 3990 standard characters followed by special chars < and &
 		edgeContent := strings.Repeat("a", 3990) + "<>&<>&<>&" + strings.Repeat("z", 100)
 		edgeMsg := &model.Message{
-			MsgType: "text",
+			MsgType: model.MsgTypeText,
 			Title:   "EdgeSender",
 			Content: edgeContent,
 		}
@@ -363,10 +373,55 @@ func TestTelegramDeliver(t *testing.T) {
 	})
 }
 
+func TestTelegramDeliver_AppNotification(t *testing.T) {
+	var receivedBody map[string]interface{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_ = json.Unmarshal(b, &receivedBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok": true}`))
+	}))
+	defer ts.Close()
+
+	tg := deliver.NewTelegramDeliver(deliver.TelegramOptions{
+		BaseURL:  ts.URL,
+		BotToken: "token",
+		ChatID:   123456,
+	})
+
+	msg := &model.Message{
+		MsgType:   model.MsgTypeAppNotification,
+		AppName:   "微信",
+		Title:     "<群聊>",
+		Content:   "重要通知 <alert>",
+		Timestamp: 1700000000,
+	}
+
+	err := tg.Send(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	text, ok := receivedBody["text"].(string)
+	if !ok {
+		t.Fatalf("expected string text in body, got %v", receivedBody["text"])
+	}
+	if !strings.Contains(text, "【微信】&lt;群聊&gt;") {
+		t.Errorf("expected escaped app title, got: %s", text)
+	}
+	if !strings.Contains(text, "重要通知 &lt;alert&gt;") {
+		t.Errorf("expected escaped content, got: %s", text)
+	}
+}
+
 func TestConsoleDeliver(t *testing.T) {
 	console := deliver.NewConsoleDeliver()
 	msg := &model.Message{
-		MsgType: "text",
+		MsgType: model.MsgTypeText,
 		Title:   "Console Test",
 		Content: "Hello Console",
 	}
@@ -539,7 +594,7 @@ func TestEmailDeliver(t *testing.T) {
 	}
 
 	msg := &model.Message{
-		MsgType: "text",
+		MsgType: model.MsgTypeText,
 		Title:   "10086",
 		Content: "Balance alert",
 	}
@@ -631,7 +686,7 @@ func TestEmailDeliver(t *testing.T) {
 
 	t.Run("non-ASCII Chinese subject is RFC 2047 encoded and symmetrically decodable", func(t *testing.T) {
 		rawData := runMockSMTP(t, &model.Message{
-			MsgType: "text",
+			MsgType: model.MsgTypeText,
 			Title:   "招商银行\r\nBcc: evil@example.com",
 			Content: "验证码 123456",
 		})
@@ -675,7 +730,7 @@ func TestEmailDeliver(t *testing.T) {
 
 	t.Run("pure ASCII subject with CRLF injection is sanitized", func(t *testing.T) {
 		rawData := runMockSMTP(t, &model.Message{
-			MsgType: "text",
+			MsgType: model.MsgTypeText,
 			Title:   "10086\r\nBcc: spy@evil.com",
 			Content: "Test ASCII",
 		})
@@ -712,7 +767,7 @@ func TestEmailDeliver(t *testing.T) {
 		start := time.Now()
 		go func() {
 			done <- client.Send(context.Background(), &model.Message{
-				MsgType: "text",
+				MsgType: model.MsgTypeText,
 				Title:   "10086",
 				Content: "timeout test",
 			})
@@ -780,7 +835,7 @@ func TestEmailDeliver(t *testing.T) {
 
 		start := time.Now()
 		err := client.Send(context.Background(), &model.Message{
-			MsgType: "text",
+			MsgType: model.MsgTypeText,
 			Title:   "10086",
 			Content: "rcpt fail test",
 		})
@@ -811,7 +866,7 @@ func TestBarkDeliver_URLsAndErrors(t *testing.T) {
 		})
 
 		msg := &model.Message{
-			MsgType: "call",
+			MsgType: model.MsgTypeCall,
 			Title:   "10010",
 		}
 
@@ -883,7 +938,7 @@ func TestBarkDeliver_ConcurrentEndpoints(t *testing.T) {
 
 	start := time.Now()
 	err := bark.Send(ctx, &model.Message{
-		MsgType: "text",
+		MsgType: model.MsgTypeText,
 		Title:   "ConcurrentTest",
 		Content: "Testing fan-out",
 	})
@@ -979,7 +1034,7 @@ func TestDispatcher_ConcurrentTargetMutationIsolation(t *testing.T) {
 
 	batt := 88
 	origMsg := &model.Message{
-		MsgType:      "text",
+		MsgType:      model.MsgTypeText,
 		Title:        "OriginalSender",
 		Content:      "Hello isolation",
 		BatteryLevel: &batt,
@@ -996,7 +1051,7 @@ func TestConsoleDeliver_CustomLogger(t *testing.T) {
 
 	console := deliver.NewConsoleDeliver(logger)
 	msg := &model.Message{
-		MsgType: "text",
+		MsgType: model.MsgTypeText,
 		Title:   "CustomLoggerSender",
 		Content: "Custom logger body",
 	}
@@ -1149,7 +1204,7 @@ func TestDeliver_BoundedResponseDrain(t *testing.T) {
 			DeviceKeys: []string{"dev1"},
 		})
 
-		if err := bark.Send(context.Background(), &model.Message{MsgType: "text", Title: "T", Content: "C"}); err != nil {
+		if err := bark.Send(context.Background(), &model.Message{MsgType: model.MsgTypeText, Title: "T", Content: "C"}); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if !body.closed {
@@ -1182,7 +1237,7 @@ func TestDeliver_BoundedResponseDrain(t *testing.T) {
 		// The body is truncated at the drain limit, so it can no longer be a complete
 		// Bot API document: the delivery is reported as unverified, but the read must
 		// still be bounded and the body must still be released.
-		err := tg.Send(context.Background(), &model.Message{MsgType: "text", Title: "T", Content: "C"})
+		err := tg.Send(context.Background(), &model.Message{MsgType: model.MsgTypeText, Title: "T", Content: "C"})
 		if err == nil {
 			t.Fatal("expected an unverified-delivery error for a truncated Bot API response, got nil")
 		}
@@ -1274,11 +1329,428 @@ func TestEmailDeliver_DataWriteError(t *testing.T) {
 	})
 
 	err := client.Send(context.Background(), &model.Message{
-		MsgType: "text",
+		MsgType: model.MsgTypeText,
 		Title:   "10086",
 		Content: "Simulate data write error",
 	})
 	if err == nil {
 		t.Fatal("expected error on broken data pipe, got nil")
+	}
+}
+
+func TestBarkDeliver_GroupStateMatrix(t *testing.T) {
+	testCases := []struct {
+		name          string
+		msg           *model.Message
+		expectedGroup string
+		shouldHaveKey bool
+	}{
+		{
+			name:          "text message",
+			msg:           &model.Message{MsgType: model.MsgTypeText, Title: "10086", Content: "Hello"},
+			expectedGroup: "text",
+			shouldHaveKey: true,
+		},
+		{
+			name:          "call message",
+			msg:           &model.Message{MsgType: model.MsgTypeCall, Title: "13800000000"},
+			expectedGroup: "call",
+			shouldHaveKey: true,
+		},
+		{
+			name:          "app notification with app_name",
+			msg:           &model.Message{MsgType: model.MsgTypeAppNotification, AppName: " 微信 ", Content: "Hello"},
+			expectedGroup: "微信",
+			shouldHaveKey: true,
+		},
+		{
+			name:          "app notification with empty app_name fallback",
+			msg:           &model.Message{MsgType: model.MsgTypeAppNotification, AppName: "", Content: "Hello"},
+			expectedGroup: "app_notification",
+			shouldHaveKey: true,
+		},
+		{
+			name:          "app notification with whitespace app_name fallback",
+			msg:           &model.Message{MsgType: model.MsgTypeAppNotification, AppName: "   ", Content: "Hello"},
+			expectedGroup: "app_notification",
+			shouldHaveKey: true,
+		},
+		{
+			name:          "empty msg_type and app_name: group key omitted",
+			msg:           &model.Message{MsgType: "", AppName: ""},
+			expectedGroup: "",
+			shouldHaveKey: false,
+		},
+		{
+			name:          "whitespace msg_type and app_name: group key omitted",
+			msg:           &model.Message{MsgType: "   ", AppName: "   "},
+			expectedGroup: "",
+			shouldHaveKey: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var receivedBody map[string]interface{}
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, err := io.ReadAll(r.Body)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				_ = json.Unmarshal(b, &receivedBody)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"code": 200}`))
+			}))
+			defer ts.Close()
+
+			bark := deliver.NewBarkDeliver(deliver.BarkOptions{
+				PostURL:    ts.URL,
+				DeviceKeys: []string{"dev_test"},
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			err := bark.Send(ctx, tc.msg)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			val, exists := receivedBody["group"]
+			if tc.shouldHaveKey {
+				if !exists {
+					t.Fatalf("expected 'group' key in payload, but it was missing")
+				}
+				if val != tc.expectedGroup {
+					t.Fatalf("expected group %q, got %q", tc.expectedGroup, val)
+				}
+			} else if exists {
+				t.Fatalf("expected 'group' key to be omitted, but got %v", val)
+			}
+		})
+	}
+}
+
+func TestBarkDeliver_TitleFourStates(t *testing.T) {
+	testCases := []struct {
+		name          string
+		appName       string
+		title         string
+		captcha       string
+		emergency     bool
+		expectedTitle string
+		expectedCopy  string
+	}{
+		{
+			name:          "state 1: full info (app_name and title) with padded captcha and emergency",
+			appName:       " 微信 ",
+			title:         " 张三 ",
+			captcha:       " 889911 ",
+			emergency:     true,
+			expectedTitle: "[微信] 张三",
+			expectedCopy:  "889911",
+		},
+		{
+			name:          "state 2: app_name only with whitespace-only captcha",
+			appName:       "微信",
+			title:         "  ",
+			captcha:       "   ",
+			expectedTitle: "[微信]",
+			expectedCopy:  "",
+		},
+		{
+			name:          "state 3: title only",
+			appName:       "",
+			title:         "系统通知",
+			expectedTitle: "New Notification From 系统通知",
+		},
+		{
+			name:          "state 4: none",
+			appName:       "  ",
+			title:         "",
+			expectedTitle: "New Notification",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var receivedBody map[string]interface{}
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(b, &receivedBody)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer ts.Close()
+
+			bark := deliver.NewBarkDeliver(deliver.BarkOptions{
+				PostURL:    ts.URL,
+				DeviceKeys: []string{"dev_test"},
+			})
+
+			msg := &model.Message{
+				MsgType:     model.MsgTypeAppNotification,
+				AppName:     tc.appName,
+				Title:       tc.title,
+				Content:     "Hello",
+				CaptchaCode: tc.captcha,
+				Emergency:   tc.emergency,
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			err := bark.Send(ctx, msg)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if got := receivedBody["title"]; got != tc.expectedTitle {
+				t.Fatalf("expected title %q, got %v", tc.expectedTitle, got)
+			}
+			if tc.expectedCopy != "" {
+				if got := receivedBody["copy"]; got != tc.expectedCopy {
+					t.Fatalf("expected copy %q, got %v", tc.expectedCopy, got)
+				}
+				if got := int(receivedBody["autoCopy"].(float64)); got != 1 {
+					t.Fatalf("expected autoCopy 1, got %v", got)
+				}
+			} else {
+				if _, exists := receivedBody["copy"]; exists {
+					t.Fatalf("expected 'copy' key to be omitted for blank captcha, got %v", receivedBody["copy"])
+				}
+				if _, exists := receivedBody["autoCopy"]; exists {
+					t.Fatalf("expected 'autoCopy' key to be omitted for blank captcha, got %v", receivedBody["autoCopy"])
+				}
+			}
+			if tc.emergency {
+				if receivedBody["level"] != "critical" || receivedBody["volume"] != "5" {
+					t.Fatalf("expected emergency critical/5, got level=%v volume=%v", receivedBody["level"], receivedBody["volume"])
+				}
+			}
+		})
+	}
+}
+
+func TestBarkDeliver_AppNotificationEncryptedAES(t *testing.T) {
+	aesKey := []byte("1234567890123456")
+	var receivedBody map[string]interface{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_ = json.Unmarshal(b, &receivedBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	bark := deliver.NewBarkDeliver(deliver.BarkOptions{
+		PostURL:    ts.URL,
+		DeviceKeys: []string{"dev_aes"},
+		CryptoKey:  aesKey,
+	})
+
+	msg := &model.Message{
+		MsgType:     model.MsgTypeAppNotification,
+		AppName:     "钉钉",
+		Title:       "告警",
+		Content:     "CPU 高",
+		CaptchaCode: "654321",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := bark.Send(ctx, msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cipherTextStr, ok := receivedBody["ciphertext"].(string)
+	if !ok || cipherTextStr == "" {
+		t.Fatalf("expected ciphertext in payload, got %v", receivedBody)
+	}
+	ivStr, ok := receivedBody["iv"].(string)
+	if !ok || ivStr == "" {
+		t.Fatalf("expected iv in payload, got %v", receivedBody)
+	}
+
+	decrypted, err := crypto.DecryptBark(crypto.BarkPayload{Ciphertext: cipherTextStr, IV: ivStr}, aesKey)
+	if err != nil {
+		t.Fatalf("failed to decrypt Bark payload: %v", err)
+	}
+
+	var innerPayload map[string]interface{}
+	if err := json.Unmarshal(decrypted, &innerPayload); err != nil {
+		t.Fatalf("failed to unmarshal decrypted JSON: %v", err)
+	}
+
+	if innerPayload["group"] != "钉钉" {
+		t.Errorf("decrypted group mismatch: got %v, want '钉钉'", innerPayload["group"])
+	}
+	if innerPayload["title"] != "[钉钉] 告警" {
+		t.Errorf("decrypted title mismatch: got %v, want '[钉钉] 告警'", innerPayload["title"])
+	}
+	if innerPayload["body"] != "CPU 高" {
+		t.Errorf("decrypted body mismatch: got %v, want 'CPU 高'", innerPayload["body"])
+	}
+	if innerPayload["copy"] != "654321" {
+		t.Errorf("decrypted copy mismatch: got %v, want '654321'", innerPayload["copy"])
+	}
+}
+
+func TestEmailDeliver_SubjectFourStates(t *testing.T) {
+	testCases := []struct {
+		name            string
+		appName         string
+		title           string
+		expectedSubject string
+	}{
+		{
+			name:            "state 1: full info (app_name and title)",
+			appName:         " 微信 ",
+			title:           " 张三 ",
+			expectedSubject: "[微信] 张三",
+		},
+		{
+			name:            "state 2: app_name only",
+			appName:         "微信",
+			title:           "  ",
+			expectedSubject: "[微信] New Notification",
+		},
+		{
+			name:            "state 3: title only",
+			appName:         "",
+			title:           "系统通知",
+			expectedSubject: "New Notification From 系统通知",
+		},
+		{
+			name:            "state 4: none",
+			appName:         "  ",
+			title:           "",
+			expectedSubject: "New Notification",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			clientConn, serverConn := net.Pipe()
+			defer func() { _ = clientConn.Close() }()
+			defer func() { _ = serverConn.Close() }()
+
+			var receivedData strings.Builder
+			go func() {
+				r := bufio.NewReader(serverConn)
+				w := bufio.NewWriter(serverConn)
+				writeLine := func(s string) {
+					_, _ = w.WriteString(s)
+					_ = w.Flush()
+				}
+				writeLine("220 smtp.example.com ESMTP\r\n")
+				for {
+					line, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					line = strings.TrimRight(line, "\r\n")
+					switch {
+					case strings.HasPrefix(line, "EHLO") || strings.HasPrefix(line, "HELO"):
+						writeLine("250 smtp.example.com\r\n")
+					case strings.HasPrefix(line, "MAIL FROM:"):
+						writeLine("250 2.1.0 Ok\r\n")
+					case strings.HasPrefix(line, "RCPT TO:"):
+						writeLine("250 2.1.5 Ok\r\n")
+					case line == "DATA":
+						writeLine("354 End data\r\n")
+						for {
+							dataLine, err := r.ReadString('\n')
+							if err != nil {
+								return
+							}
+							if dataLine == ".\r\n" {
+								writeLine("250 2.0.0 Ok: queued\r\n")
+								break
+							}
+							receivedData.WriteString(dataLine)
+						}
+					case line == "QUIT":
+						writeLine("221 2.0.0 Bye\r\n")
+						return
+					}
+				}
+			}()
+
+			emailClient := deliver.NewEmailDeliver(deliver.EmailOptions{
+				SenderEmail:   "sender@example.com",
+				ReceiverEmail: "receiver@example.com",
+				SMTPServer:    "localhost",
+				SMTPPort:      465,
+				CustomDialer: func(_ context.Context, _, _ string) (net.Conn, error) {
+					return clientConn, nil
+				},
+			})
+
+			msg := &model.Message{
+				MsgType: model.MsgTypeAppNotification,
+				AppName: tc.appName,
+				Title:   tc.title,
+				Content: "Test content",
+			}
+
+			err := emailClient.Send(context.Background(), msg)
+			if err != nil {
+				t.Fatalf("email Send failed: %v", err)
+			}
+
+			content := receivedData.String()
+			lines := strings.Split(content, "\r\n")
+			var subjectLine string
+			for _, l := range lines {
+				if strings.HasPrefix(l, "Subject: ") {
+					subjectLine = strings.TrimPrefix(l, "Subject: ")
+					break
+				}
+			}
+			if subjectLine == "" {
+				t.Fatalf("Subject header not found in:\n%s", content)
+			}
+
+			var dec mime.WordDecoder
+			decodedSubject, err := dec.DecodeHeader(subjectLine)
+			if err != nil {
+				decodedSubject = subjectLine
+			}
+			if decodedSubject != tc.expectedSubject {
+				t.Fatalf("Subject mismatch: got %q, want %q (raw header: %q)", decodedSubject, tc.expectedSubject, subjectLine)
+			}
+		})
+	}
+}
+
+func TestConsoleDeliver_LogAppName(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	console := deliver.NewConsoleDeliver(logger)
+	msg := &model.Message{
+		MsgType: model.MsgTypeAppNotification,
+		AppName: "企业微信",
+		Title:   "工作汇报",
+		Content: "今天的工作已完成",
+	}
+
+	err := console.Send(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, "app_name=企业微信") {
+		t.Fatalf("expected log to contain 'app_name=企业微信', got:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "msg_type=app_notification") {
+		t.Fatalf("expected log to contain 'msg_type=app_notification', got:\n%s", logOutput)
 	}
 }

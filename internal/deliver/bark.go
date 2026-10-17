@@ -150,19 +150,46 @@ func (b *BarkDeliver) Send(ctx context.Context, msg *model.Message) error {
 		"body":      msg.Content,
 	}
 
+	// 推导 Bark 分组逻辑（严格防空值，支持 AppName 特化）
+	group := strings.TrimSpace(string(msg.MsgType))
+	if msg.MsgType == model.MsgTypeAppNotification {
+		if appName := strings.TrimSpace(msg.AppName); appName != "" {
+			group = appName
+		} else {
+			group = string(model.MsgTypeAppNotification)
+		}
+	}
+	if group != "" {
+		basePayload["group"] = group
+	}
+
 	var copyContent string
 	switch msg.MsgType {
-	case "call":
-		basePayload["title"] = fmt.Sprintf("New Call From %s", msg.Title)
-		copyContent = msg.Title
-	case "text":
-		basePayload["title"] = fmt.Sprintf("New Message From %s", msg.Title)
-		copyContent = msg.CaptchaCode
-	default:
-		if msg.Title != "" {
-			basePayload["title"] = msg.Title
+	case model.MsgTypeCall:
+		basePayload["title"] = fmt.Sprintf("New Call From %s", strings.TrimSpace(msg.Title))
+		copyContent = strings.TrimSpace(msg.Title)
+	case model.MsgTypeText:
+		basePayload["title"] = fmt.Sprintf("New Message From %s", strings.TrimSpace(msg.Title))
+		copyContent = strings.TrimSpace(msg.CaptchaCode)
+	case model.MsgTypeAppNotification:
+		appName := strings.TrimSpace(msg.AppName)
+		title := strings.TrimSpace(msg.Title)
+		switch {
+		case appName != "" && title != "":
+			basePayload["title"] = fmt.Sprintf("[%s] %s", appName, title)
+		case appName != "":
+			basePayload["title"] = fmt.Sprintf("[%s]", appName)
+		case title != "":
+			basePayload["title"] = fmt.Sprintf("New Notification From %s", title)
+		default:
+			basePayload["title"] = "New Notification"
 		}
-		copyContent = msg.CaptchaCode
+		copyContent = strings.TrimSpace(msg.CaptchaCode)
+	default:
+		if title := strings.TrimSpace(msg.Title); title != "" {
+			basePayload["title"] = title
+		}
+		copyContent = strings.TrimSpace(msg.CaptchaCode)
 	}
 
 	if copyContent != "" {

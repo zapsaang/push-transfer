@@ -57,9 +57,25 @@ func (ft FlexibleTimestamp) Format(loc *time.Location) string {
 	return time.Unix(int64(ft), 0).In(loc).Format("2006-01-02 15:04:05")
 }
 
+// MsgType represents the strongly-typed message category.
+type MsgType string
+
+// Supported standard message types across push-transfer.
+const (
+	MsgTypeText            MsgType = "text"
+	MsgTypeCall            MsgType = "call"
+	MsgTypeAppNotification MsgType = "app_notification"
+)
+
+// Valid reports whether m is one of the supported message types.
+func (m MsgType) Valid() bool {
+	return m == MsgTypeText || m == MsgTypeCall || m == MsgTypeAppNotification
+}
+
 // Message represents the standard data transfer object across push-transfer.
 type Message struct {
-	MsgType      string            `json:"msg_type"`
+	MsgType      MsgType           `json:"msg_type"`
+	AppName      string            `json:"app_name,omitempty"`
 	Title        string            `json:"title"`
 	Content      string            `json:"content"`
 	BatteryLevel *int              `json:"battery_level,omitempty"`
@@ -74,11 +90,17 @@ type Message struct {
 
 // SetCaptcha sets the extracted captcha code.
 func (m *Message) SetCaptcha(captchaCode string) {
+	if m == nil {
+		return
+	}
 	m.CaptchaCode = captchaCode
 }
 
 // SetEmergency sets whether this message is an emergency alert.
 func (m *Message) SetEmergency(emergency bool) {
+	if m == nil {
+		return
+	}
 	m.Emergency = emergency
 }
 
@@ -104,9 +126,12 @@ func firstValidTimestamp(candidates ...FlexibleTimestamp) FlexibleTimestamp {
 	return 0
 }
 
-// GenComplexText generates human-readable multi-channel text in the historical
-// text format of the removed Python implementation.
+// GenComplexText generates human-readable multi-channel text across supported message types.
 func (m *Message) GenComplexText(loc ...*time.Location) string {
+	if m == nil {
+		return ""
+	}
+
 	var l *time.Location
 	if len(loc) > 0 && loc[0] != nil {
 		l = loc[0]
@@ -114,17 +139,41 @@ func (m *Message) GenComplexText(loc ...*time.Location) string {
 
 	var text string
 	switch m.MsgType {
-	case "call":
-		incomingTime := firstValidTimestamp(m.IncomingTime, m.Timestamp, m.SendTime, m.ReceiveTime)
-		text = fmt.Sprintf("未接来电：%s\n\n来电时间：%s\n", m.Title, incomingTime.Format(l))
-	case "text":
+	case MsgTypeCall:
+		incomingTime := firstValidTimestamp(m.IncomingTime, m.Timestamp, m.SendTime, m.ReceiveTime, m.TransmitTime)
+		text = fmt.Sprintf("未接来电：%s\n\n来电时间：%s\n", strings.TrimSpace(m.Title), incomingTime.Format(l))
+	case MsgTypeText:
 		sendTime := firstValidTimestamp(m.TransmitTime, m.SendTime, m.Timestamp)
 		receiveTime := firstValidTimestamp(m.ReceiveTime, m.Timestamp)
 		text = fmt.Sprintf("%s\n\n短信来自: %s\n\n发送时间：%s\n转发时间：%s\n",
-			m.Content, m.Title, sendTime.Format(l), receiveTime.Format(l))
+			strings.TrimSpace(m.Content), strings.TrimSpace(m.Title), sendTime.Format(l), receiveTime.Format(l))
+	case MsgTypeAppNotification:
+		eventTime := firstValidTimestamp(m.Timestamp, m.ReceiveTime, m.SendTime, m.TransmitTime, m.IncomingTime)
+		appName := strings.TrimSpace(m.AppName)
+		if appName == "" {
+			appName = "应用通知"
+		}
+		title := strings.TrimSpace(m.Title)
+		header := fmt.Sprintf("【%s】", appName)
+		if title != "" {
+			header = fmt.Sprintf("【%s】%s", appName, title)
+		}
+		content := strings.TrimSpace(m.Content)
+		if content != "" {
+			text = fmt.Sprintf("%s\n\n%s\n\n通知时间：%s\n", header, content, eventTime.Format(l))
+		} else {
+			text = fmt.Sprintf("%s\n\n通知时间：%s\n", header, eventTime.Format(l))
+		}
 	default:
-		if m.Title != "" || m.Content != "" {
-			text = fmt.Sprintf("%s\n\n%s\n", m.Title, m.Content)
+		title := strings.TrimSpace(m.Title)
+		content := strings.TrimSpace(m.Content)
+		switch {
+		case title != "" && content != "":
+			text = fmt.Sprintf("%s\n\n%s\n", title, content)
+		case title != "":
+			text = fmt.Sprintf("%s\n", title)
+		case content != "":
+			text = fmt.Sprintf("%s\n", content)
 		}
 	}
 
