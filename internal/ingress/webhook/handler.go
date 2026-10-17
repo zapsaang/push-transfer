@@ -180,6 +180,9 @@ func parseIPCandidate(raw string) string {
 }
 
 func extractRealIP(r *http.Request, customNets []*net.IPNet) string {
+	if r == nil {
+		return ""
+	}
 	remoteHost := strings.TrimSpace(r.RemoteAddr)
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && host != "" {
 		remoteHost = host

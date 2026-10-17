@@ -43,38 +43,66 @@ func TestConfig_OptionalChannels(t *testing.T) {
 	if len(cfg.Auth.Credentials) != 1 || cfg.Auth.Credentials[0].Token != "my-secret-token" {
 		t.Errorf("expected one credential with token 'my-secret-token', got %+v", cfg.Auth.Credentials)
 	}
-	if cfg.RunTrigger {
-		t.Errorf("expected RunTrigger to be false by default, got true")
+	if cfg.RunMode != "" {
+		t.Errorf("expected RunMode to be empty when unset, got %q", cfg.RunMode)
 	}
 }
 
-func TestConfig_RunTrigger(t *testing.T) {
-	cases := []struct {
-		val      string
-		expected bool
+func TestConfig_RunMode(t *testing.T) {
+	validCases := []struct {
+		raw         string
+		wantMode    RunMode
+		wantValid   bool
+		wantWebhook bool
+		wantIMAP    bool
 	}{
-		{"true", true},
-		{"TRUE", true},
-		{"1", true},
-		{"false", false},
-		{"0", false},
-		{"", false},
-		{"invalid", false},
+		{"webhook", RunModeWebhook, true, true, false},
+		{"WEBHOOK", RunModeWebhook, true, true, false},
+		{"  Imap  ", RunModeIMAP, true, false, true},
+		{"both", RunModeBoth, true, true, true},
+		{"BOTH", RunModeBoth, true, true, true},
+		{"", "", false, false, false},
+		{"   ", "", false, false, false},
 	}
 
-	for _, tc := range cases {
+	for _, tc := range validCases {
 		lookup := func(k string) string {
-			if k == "RUN_TRIGGER" {
-				return tc.val
+			if k == "RUN_MODE" {
+				return tc.raw
 			}
 			return ""
 		}
 		cfg, err := LoadFromLookup(lookup)
 		if err != nil {
-			t.Fatalf("unexpected error for RUN_TRIGGER=%q: %v", tc.val, err)
+			t.Fatalf("unexpected error for RUN_MODE=%q: %v", tc.raw, err)
 		}
-		if cfg.RunTrigger != tc.expected {
-			t.Errorf("for RUN_TRIGGER=%q expected %v, got %v", tc.val, tc.expected, cfg.RunTrigger)
+		if cfg.RunMode != tc.wantMode {
+			t.Errorf("RUN_MODE=%q: got %q, want %q", tc.raw, cfg.RunMode, tc.wantMode)
+		}
+		if got := cfg.RunMode.Valid(); got != tc.wantValid {
+			t.Errorf("RUN_MODE=%q: Valid()=%v, want %v", tc.raw, got, tc.wantValid)
+		}
+		if got := cfg.RunMode.StartsWebhook(); got != tc.wantWebhook {
+			t.Errorf("RUN_MODE=%q: StartsWebhook()=%v, want %v", tc.raw, got, tc.wantWebhook)
+		}
+		if got := cfg.RunMode.StartsIMAP(); got != tc.wantIMAP {
+			t.Errorf("RUN_MODE=%q: StartsIMAP()=%v, want %v", tc.raw, got, tc.wantIMAP)
+		}
+	}
+
+	for _, invalid := range []string{"yes", "true", "false", "1", "0", "http", "invalid"} {
+		lookup := func(k string) string {
+			if k == "RUN_MODE" {
+				return invalid
+			}
+			return ""
+		}
+		_, err := LoadFromLookup(lookup)
+		if err == nil {
+			t.Fatalf("expected error for invalid RUN_MODE=%q, got nil", invalid)
+		}
+		if !strings.Contains(err.Error(), "RUN_MODE must be one of webhook, imap, both") {
+			t.Errorf("RUN_MODE=%q: unexpected error %v", invalid, err)
 		}
 	}
 }
@@ -240,12 +268,17 @@ func TestConfig_Validation(t *testing.T) {
 
 	// Test invalid regex JSON
 	t.Run("invalid regex json array", func(t *testing.T) {
-		envMap := map[string]string{
-			"REGEX_CAPTCHA": `not-a-json-array`,
-		}
-		_, err := LoadFromLookup(func(k string) string { return envMap[k] })
-		if err == nil {
-			t.Fatal("expected error for invalid REGEX_CAPTCHA JSON, got nil")
+		for _, key := range []string{"REGEX_FILTER_BLACK", "REGEX_FILTER_WHITE", "REGEX_CAPTCHA", "REGEX_EMERGENCY"} {
+			envMap := map[string]string{
+				key: `not-a-json-array`,
+			}
+			_, err := LoadFromLookup(func(k string) string { return envMap[k] })
+			if err == nil {
+				t.Fatalf("expected error for invalid %s JSON, got nil", key)
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Errorf("expected error to mention %s, got: %v", key, err)
+			}
 		}
 	})
 
@@ -321,7 +354,7 @@ func TestConfig_Validation(t *testing.T) {
 		}
 	})
 
-	// Test Load() with os.Getenv
+	// Test Load() and LoadFromLookup(nil) with os.Getenv
 	t.Run("Load with os.Getenv", func(t *testing.T) {
 		cfg, err := Load()
 		if err != nil {
@@ -329,6 +362,14 @@ func TestConfig_Validation(t *testing.T) {
 		}
 		if cfg == nil {
 			t.Fatal("expected non-nil config from Load()")
+		}
+
+		cfgNil, err := LoadFromLookup(nil)
+		if err != nil {
+			t.Fatalf("LoadFromLookup(nil) failed: %v", err)
+		}
+		if cfgNil == nil {
+			t.Fatal("expected non-nil config from LoadFromLookup(nil)")
 		}
 	})
 }
@@ -375,7 +416,7 @@ func TestConfig_HasWebhookAuth(t *testing.T) {
 }
 
 func TestConfig_AuthCredentialsParse(t *testing.T) {
-	t.Run("valid multi-entry with defaults and whitespace trimming", func(t *testing.T) {
+	t.Run("token/name trimming; Basic bytes preserved", func(t *testing.T) {
 		input := `[
 			{"name":"phone-a","token":"  tok-a  "},
 			{"token":"tok-b"},
@@ -395,7 +436,7 @@ func TestConfig_AuthCredentialsParse(t *testing.T) {
 		expected := []Credential{
 			{Name: "phone-a", Token: "tok-a"},
 			{Name: "credential-2", Token: "tok-b"},
-			{Name: "custom-basic", Username: "usr-c", Password: "pwd-c"},
+			{Name: "custom-basic", Username: "  usr-c  ", Password: "  pwd-c  "},
 		}
 		for i, exp := range expected {
 			got := cfg.Auth.Credentials[i]
@@ -463,6 +504,11 @@ func TestConfig_AuthCredentialsValidation(t *testing.T) {
 		{
 			name:        "V2_trailing_garbage",
 			input:       `[{"token":"secret"}] trailing_data`,
+			errContains: "trailing data",
+		},
+		{
+			name:        "V2_trailing_valid_json_value",
+			input:       `[{"token":"secret"}] {}`,
 			errContains: "trailing data",
 		},
 
@@ -543,16 +589,9 @@ func TestConfig_AuthCredentialsValidation(t *testing.T) {
 			errContains: "entry 1: \"name\" must not exceed 64 characters",
 		},
 
-		// V9: Name starts with reserved prefix env:
+		// V9: More than 64 entries
 		{
-			name:        "V9_name_reserved_prefix",
-			input:       `[{"name":"env:custom","token":"tok1"}]`,
-			errContains: "entry 1: \"name\" must not start with reserved prefix \"env:\"",
-		},
-
-		// V10: More than 64 entries
-		{
-			name: "V10_exceeds_64_entries",
+			name: "V9_exceeds_64_entries",
 			input: func() string {
 				var items []string
 				for i := 1; i <= 65; i++ {
@@ -580,6 +619,21 @@ func TestConfig_AuthCredentialsValidation(t *testing.T) {
 	}
 }
 
+func TestConfig_AuthCredentialsAllowsArbitraryNamePrefix(t *testing.T) {
+	cfg, err := LoadFromLookup(func(k string) string {
+		if k == "AUTH_CREDENTIALS" {
+			return `[{"name":"env:custom","token":"tok1"}]`
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("expected 'env:custom' name to be accepted, got: %v", err)
+	}
+	if len(cfg.Auth.Credentials) != 1 || cfg.Auth.Credentials[0].Name != "env:custom" {
+		t.Fatalf("unexpected credentials: %+v", cfg.Auth.Credentials)
+	}
+}
+
 // TestConfig_AuthCredentialsErrorNeverLeaksSecretMaterial is a permanent negative regression
 // guard: AUTH_CREDENTIALS holds plaintext tokens/passwords, and the startup failure path
 // (config error -> slog.Error in main) must never echo the raw value.
@@ -591,6 +645,7 @@ func TestConfig_AuthCredentialsErrorNeverLeaksSecretMaterial(t *testing.T) {
 		input string
 	}{
 		{"trailing garbage", `[{"token":"` + secret + `"}] oops`},
+		{"trailing valid json value", `[{"token":"` + secret + `"}] {}`},
 		{"malformed json", `{"token":"` + secret + `"`},
 		{"truncated array", `[{"token":"` + secret + `"},`},
 		{"unknown field", `[{"tokn":"` + secret + `"}]`},
@@ -610,7 +665,7 @@ func TestConfig_AuthCredentialsErrorNeverLeaksSecretMaterial(t *testing.T) {
 	}
 }
 
-// TestConfig_AuthCredentialsBoundaries locks the inclusive/exclusive edges of V7-V10 and the
+// TestConfig_AuthCredentialsBoundaries locks the inclusive/exclusive edges of V8-V9 and the
 // JSON decoding contracts (case-insensitive keys, explicit null == absent).
 func TestConfig_AuthCredentialsBoundaries(t *testing.T) {
 	t.Run("exactly 64 entries is accepted", func(t *testing.T) {
@@ -648,7 +703,7 @@ func TestConfig_AuthCredentialsBoundaries(t *testing.T) {
 		}
 	})
 
-	t.Run("reserved prefix only rejected at the start of the name", func(t *testing.T) {
+	t.Run("colon in credential name is accepted", func(t *testing.T) {
 		cfg, err := LoadFromLookup(func(k string) string {
 			if k == "AUTH_CREDENTIALS" {
 				return `[{"name":"myenv:device","token":"tok"}]`
@@ -736,6 +791,26 @@ func TestConfig_AuthCredentialsRejectsDuplicateFactors(t *testing.T) {
 			input:       `[{"name":"a","username":"u","password":"p"},{"name":"b","token":"t","username":"u","password":"p"}]`,
 			errContains: `entry 2: duplicate "username"/"password" pair already used by entry 1`,
 		},
+		{
+			name:        "C-5: padded name collides with trimmed name (V7)",
+			input:       `[{"name":" a ","token":"t1"},{"name":"a","token":"t2"}]`,
+			errContains: `entry 2: duplicate credential name "a"`,
+		},
+		{
+			name:        "C-5: padded token collides with trimmed token",
+			input:       `[{"name":"a","token":" tok "},{"name":"b","token":"tok"}]`,
+			errContains: `entry 2: duplicate "token" already used by entry 1`,
+		},
+		{
+			name:        "C-5: two identical padded basic passwords collide",
+			input:       `[{"name":"a","username":"u","password":" pass "},{"name":"b","username":"u","password":" pass "}]`,
+			errContains: `entry 2: duplicate "username"/"password" pair already used by entry 1`,
+		},
+		{
+			name:        "C-5: two identical padded basic usernames collide",
+			input:       `[{"name":"a","username":" u ","password":"p"},{"name":"b","username":" u ","password":"p"}]`,
+			errContains: `entry 2: duplicate "username"/"password" pair already used by entry 1`,
+		},
 	}
 
 	for _, tc := range cases {
@@ -777,6 +852,14 @@ func TestConfig_AuthCredentialsAllowsDistinctFactors(t *testing.T) {
 		{
 			name:  "token and basic pair on the same entry",
 			input: `[{"name":"a","token":"t","username":"u","password":"p"}]`,
+		},
+		{
+			name:  "basic password with leading/trailing spaces is distinct from trimmed password",
+			input: `[{"name":"a","username":"u","password":" pass "},{"name":"b","username":"u","password":"pass"}]`,
+		},
+		{
+			name:  "basic username with leading/trailing spaces is distinct from trimmed username",
+			input: `[{"name":"a","username":" u ","password":"p"},{"name":"b","username":"u","password":"p"}]`,
 		},
 	}
 
@@ -1004,12 +1087,15 @@ func TestConfig_IMAPMailbox(t *testing.T) {
 func TestConfig_PartialChannelHelpers(t *testing.T) {
 	t.Run("TelegramConfig helpers", func(t *testing.T) {
 		var nilTG *TelegramConfig
-		if nilTG.Enabled() || nilTG.HasPartialConfig() || nilTG.IsPartial() {
+		if nilTG.Enabled() || nilTG.HasPartialConfig() {
 			t.Fatal("expected false for nil TelegramConfig")
+		}
+		if (&TelegramConfig{}).Enabled() || (&TelegramConfig{}).HasPartialConfig() {
+			t.Fatal("expected false for zero TelegramConfig")
 		}
 
 		partialTokenOnly := &TelegramConfig{BotToken: "token"}
-		if partialTokenOnly.Enabled() || !partialTokenOnly.HasPartialConfig() || !partialTokenOnly.IsPartial() {
+		if partialTokenOnly.Enabled() || !partialTokenOnly.HasPartialConfig() {
 			t.Fatal("expected partial config when only BotToken is set")
 		}
 
@@ -1019,19 +1105,22 @@ func TestConfig_PartialChannelHelpers(t *testing.T) {
 		}
 
 		fullTG := &TelegramConfig{BotToken: "token", ChatID: 12345}
-		if !fullTG.Enabled() || fullTG.HasPartialConfig() || fullTG.IsPartial() {
+		if !fullTG.Enabled() || fullTG.HasPartialConfig() {
 			t.Fatal("expected Enabled=true and Partial=false for complete TelegramConfig")
 		}
 	})
 
 	t.Run("EmailConfig helpers", func(t *testing.T) {
 		var nilEmail *EmailConfig
-		if nilEmail.Enabled() || nilEmail.HasPartialConfig() || nilEmail.IsPartial() {
+		if nilEmail.Enabled() || nilEmail.HasPartialConfig() {
 			t.Fatal("expected false for nil EmailConfig")
+		}
+		if (&EmailConfig{}).Enabled() || (&EmailConfig{}).HasPartialConfig() {
+			t.Fatal("expected false for zero EmailConfig")
 		}
 
 		partialSenderOnly := &EmailConfig{SenderEmail: "a@b.com"}
-		if partialSenderOnly.Enabled() || !partialSenderOnly.HasPartialConfig() || !partialSenderOnly.IsPartial() {
+		if partialSenderOnly.Enabled() || !partialSenderOnly.HasPartialConfig() {
 			t.Fatal("expected partial config when only SenderEmail is set")
 		}
 
@@ -1041,19 +1130,22 @@ func TestConfig_PartialChannelHelpers(t *testing.T) {
 		}
 
 		fullEmail := &EmailConfig{SenderEmail: "a@b.com", ReceiverEmail: "c@d.com"}
-		if !fullEmail.Enabled() || fullEmail.HasPartialConfig() || fullEmail.IsPartial() {
+		if !fullEmail.Enabled() || fullEmail.HasPartialConfig() {
 			t.Fatal("expected Enabled=true and Partial=false for complete EmailConfig")
 		}
 	})
 
 	t.Run("IMAPConfig helpers", func(t *testing.T) {
 		var nilIMAP *IMAPConfig
-		if nilIMAP.Enabled() || nilIMAP.HasPartialConfig() || nilIMAP.IsPartial() {
+		if nilIMAP.Enabled() || nilIMAP.HasPartialConfig() {
 			t.Fatal("expected false for nil IMAPConfig")
+		}
+		if (&IMAPConfig{}).Enabled() || (&IMAPConfig{}).HasPartialConfig() {
+			t.Fatal("expected false for zero IMAPConfig")
 		}
 
 		partialLoginOnly := &IMAPConfig{LoginEmail: "user@example.com"}
-		if partialLoginOnly.Enabled() || !partialLoginOnly.HasPartialConfig() || !partialLoginOnly.IsPartial() {
+		if partialLoginOnly.Enabled() || !partialLoginOnly.HasPartialConfig() {
 			t.Fatal("expected partial config when only LoginEmail is set")
 		}
 
@@ -1063,7 +1155,7 @@ func TestConfig_PartialChannelHelpers(t *testing.T) {
 		}
 
 		fullIMAP := &IMAPConfig{LoginEmail: "user@example.com", Password: "secret"}
-		if !fullIMAP.Enabled() || fullIMAP.HasPartialConfig() || fullIMAP.IsPartial() {
+		if !fullIMAP.Enabled() || fullIMAP.HasPartialConfig() {
 			t.Fatal("expected Enabled=true and Partial=false for complete IMAPConfig")
 		}
 	})
@@ -1073,11 +1165,19 @@ func TestConfig_PartialChannelHelpers(t *testing.T) {
 			t.Fatal("expected HasWebhookAuth=false for empty AuthConfig")
 		}
 
-		// Whitespace-only material never survives parseCredentials, but the predicate must not
-		// be fooled by a hand-built AuthConfig either: it counts entries, not raw characters.
-		wsAuth := AuthConfig{Credentials: []Credential{{Name: "ws", Token: "  "}}}
-		if !wsAuth.HasWebhookAuth() {
-			t.Fatal("expected HasWebhookAuth to count the entry; parseCredentials is what rejects blanks")
+		for _, unusable := range []struct {
+			name string
+			cred Credential
+		}{
+			{"blank token", Credential{Name: "ws", Token: "  "}},
+			{"one-sided basic username only", Credential{Name: "half-u", Username: "admin", Password: "   "}},
+			{"one-sided basic password only", Credential{Name: "half-p", Username: "", Password: "secret"}},
+			{"empty material", Credential{Name: "empty"}},
+		} {
+			a := AuthConfig{Credentials: []Credential{unusable.cred}}
+			if a.HasWebhookAuth() {
+				t.Fatalf("%s: expected HasWebhookAuth=false for unusable credential %+v", unusable.name, unusable.cred)
+			}
 		}
 
 		fullBasic := AuthConfig{Credentials: []Credential{{Name: "basic", Username: "admin", Password: "secret"}}}
@@ -1144,6 +1244,18 @@ func TestConfig_StandaloneEnvVars_TriggerPartialConfig(t *testing.T) {
 		}
 		if !cfg.IMAP.HasPartialConfig() {
 			t.Fatal("expected cfg.IMAP.HasPartialConfig() == true when only EMAIL_TRIGGER_MAILBOX is set")
+		}
+	})
+
+	t.Run("programmatic custom IMAPPort or SMTPPort alone triggers partial config", func(t *testing.T) {
+		imapPortOnly := &IMAPConfig{IMAPPort: 1993}
+		if !imapPortOnly.HasPartialConfig() {
+			t.Fatal("expected IMAPConfig{IMAPPort: 1993}.HasPartialConfig() == true")
+		}
+
+		emailPortOnly := &EmailConfig{SMTPPort: 587}
+		if !emailPortOnly.HasPartialConfig() {
+			t.Fatal("expected EmailConfig{SMTPPort: 587}.HasPartialConfig() == true")
 		}
 	})
 }

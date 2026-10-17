@@ -33,7 +33,7 @@ func TestCredentialSet_ComparisonCountIsInputIndependent(t *testing.T) {
 	// c1: Token (T=1, B=0)
 	// c2: Basic (T=0, B=1)
 	// c3: Token + Basic (T=1, B=1)
-	// Total: T=2, B=2. Expected comparison count per verify = 2*T + 2*B = 2*2 + 2*2 = 8.
+	// Total: T=2, B=2. Expected comparison count per verify = T + 2*B = 2 + 2*2 = 6.
 	rawCreds := []config.Credential{
 		{Name: "c1", Token: "token-1"},
 		{Name: "c2", Username: "user2", Password: "pass2"},
@@ -41,7 +41,7 @@ func TestCredentialSet_ComparisonCountIsInputIndependent(t *testing.T) {
 	}
 
 	set := newCredentialSet(rawCreds)
-	const expectedComparisons = 8
+	const expectedComparisons = 6
 
 	var callCount int
 	set.eq = func(a, b digest) int {
@@ -59,16 +59,6 @@ func TestCredentialSet_ComparisonCountIsInputIndependent(t *testing.T) {
 			name: "hit first token (bearer)",
 			setupReq: func(r *http.Request) {
 				r.Header.Set("Authorization", "Bearer token-1")
-			},
-			wantAuth: true,
-			wantCred: "c1",
-		},
-		{
-			name: "hit first token (query)",
-			setupReq: func(r *http.Request) {
-				q := r.URL.Query()
-				q.Set("token", "token-1")
-				r.URL.RawQuery = q.Encode()
 			},
 			wantAuth: true,
 			wantCred: "c1",
@@ -113,12 +103,9 @@ func TestCredentialSet_ComparisonCountIsInputIndependent(t *testing.T) {
 			wantCred: "",
 		},
 		{
-			name: "all wrong auth types present simultaneously",
+			name: "wrong bearer token only",
 			setupReq: func(r *http.Request) {
 				r.Header.Set("Authorization", "Bearer invalid")
-				q := r.URL.Query()
-				q.Set("token", "invalid-query")
-				r.URL.RawQuery = q.Encode()
 			},
 			wantAuth: false,
 			wantCred: "",
@@ -168,10 +155,17 @@ func TestCredentialSet_ReportedName(t *testing.T) {
 	if ok || name != "" {
 		t.Errorf("expected ('', false) for mismatch, got (%q, %v)", name, ok)
 	}
+
+	wsNameSet := newCredentialSet([]config.Credential{{Name: "   ", Token: "t"}})
+	reqWS := httptest.NewRequest(http.MethodPost, "/webhook", http.NoBody)
+	reqWS.Header.Set("Authorization", "Bearer t")
+	if gotName, gotOK := wsNameSet.verify(reqWS); !gotOK || gotName != "" {
+		t.Errorf("expected ('', true) for whitespace-only Name, got (%q, %v)", gotName, gotOK)
+	}
 }
 
-// TestCredentialSet_DefensiveGuards locks the two guard branches of verify: a nil/empty set must
-// deny without panicking, and an unset comparer must fall back to constant-time comparison.
+// TestCredentialSet_DefensiveGuards locks the guard branches of verify: a nil/empty set or nil
+// request must deny without panicking, and an unset comparer must fall back to constant-time comparison.
 func TestCredentialSet_DefensiveGuards(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/webhook", http.NoBody)
 	req.Header.Set("Authorization", "Bearer anything")
@@ -192,9 +186,12 @@ func TestCredentialSet_DefensiveGuards(t *testing.T) {
 		t.Error("set built from no credentials must report empty")
 	}
 
-	// A set whose comparer field was cleared must still authenticate correctly.
+	// A set whose comparer field was cleared must still authenticate correctly, and must deny nil *http.Request.
 	fallback := newCredentialSet([]config.Credential{{Name: "fallback", Token: "tok-fallback"}})
 	fallback.eq = nil
+	if name, ok := fallback.verify(nil); ok || name != "" {
+		t.Errorf("verify(nil) must deny without panicking, got (%q, %v)", name, ok)
+	}
 	reqOK := httptest.NewRequest(http.MethodPost, "/webhook", http.NoBody)
 	reqOK.Header.Set("Authorization", "Bearer tok-fallback")
 	if name, ok := fallback.verify(reqOK); !ok || name != "fallback" {
@@ -202,39 +199,76 @@ func TestCredentialSet_DefensiveGuards(t *testing.T) {
 	}
 }
 
-// TestCredentialSet_MultipleMatchingEntries pins the deterministic reported identity when one
-// request presents two independently valid factors. Bearer and Basic can never coexist (both
-// ride the single Authorization header), so the co-present case is `?token=` + Basic.
-func TestCredentialSet_MultipleMatchingEntries(t *testing.T) {
+func TestCredentialSet_BasicPreservesExactBytes(t *testing.T) {
 	set := newCredentialSet([]config.Credential{
-		{Name: "token-entry", Token: "tok-shared"},
-		{Name: "basic-entry", Username: "u", Password: "p"},
+		{Name: "basic", Username: "u", Password: " pass "},
+		{Name: "basic-user", Username: " user ", Password: "p"},
 	})
 
-	t.Run("query token plus basic reports the first matching entry", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/webhook?token=tok-shared", http.NoBody)
-		req.SetBasicAuth("u", "p")
+	reqExact := httptest.NewRequest(http.MethodPost, "/webhook", http.NoBody)
+	reqExact.SetBasicAuth("u", " pass ")
+	if name, ok := set.verify(reqExact); !ok || name != "basic" {
+		t.Errorf("expected exact password ' pass ' to match, got (%q, %v)", name, ok)
+	}
 
-		name, ok := set.verify(req)
-		if !ok {
-			t.Fatal("expected authorization to succeed")
-		}
-		if name != "token-entry" {
-			t.Errorf("expected the first matching entry name to be reported, got %q", name)
-		}
+	reqTrimmed := httptest.NewRequest(http.MethodPost, "/webhook", http.NoBody)
+	reqTrimmed.SetBasicAuth("u", "pass")
+	if name, ok := set.verify(reqTrimmed); ok || name != "" {
+		t.Errorf("expected trimmed password 'pass' not to match ' pass ', got (%q, %v)", name, ok)
+	}
+
+	reqUserExact := httptest.NewRequest(http.MethodPost, "/webhook", http.NoBody)
+	reqUserExact.SetBasicAuth(" user ", "p")
+	if name, ok := set.verify(reqUserExact); !ok || name != "basic-user" {
+		t.Errorf("expected exact username ' user ' to match, got (%q, %v)", name, ok)
+	}
+
+	reqUserTrimmed := httptest.NewRequest(http.MethodPost, "/webhook", http.NoBody)
+	reqUserTrimmed.SetBasicAuth("user", "p")
+	if name, ok := set.verify(reqUserTrimmed); ok || name != "" {
+		t.Errorf("expected trimmed username 'user' not to match ' user ', got (%q, %v)", name, ok)
+	}
+}
+
+// TestCredentialSet_FirstMatchWins exercises the first-match audit rule. parseCredentials rejects
+// duplicate factors, so this state is reachable only through programmatic construction; the
+// `name == ""` guard in verify must still be a deliberate, tested rule rather than an untestable
+// defensive branch.
+func TestCredentialSet_FirstMatchWins(t *testing.T) {
+	set := newCredentialSet([]config.Credential{
+		{Name: "first", Token: "duplicate-token"},
+		{Name: "second", Token: "duplicate-token"},
 	})
 
-	t.Run("basic auth header suppresses a bearer token", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/webhook", http.NoBody)
-		req.Header.Set("Authorization", "Bearer tok-shared")
-		req.SetBasicAuth("u", "p") // overwrites the Authorization header
+	req := httptest.NewRequest(http.MethodPost, "/webhook", http.NoBody)
+	req.Header.Set("Authorization", "Bearer duplicate-token")
 
-		name, ok := set.verify(req)
-		if !ok {
-			t.Fatal("expected authorization to succeed via the basic factor")
+	name, ok := set.verify(req)
+	if !ok || name != "first" {
+		t.Errorf("expected the first matching credential name to win, got (%q, %v)", name, ok)
+	}
+}
+
+// TestCredentialFactorsMatchCompiler is a cross-package drift guard: config.Credential.Usable()
+// and webhook.newCredentialSet must agree on every credential shape.
+func TestCredentialFactorsMatchCompiler(t *testing.T) {
+	samples := []config.Credential{
+		{},
+		{Name: "empty"},
+		{Name: "ws-token", Token: "   \t\n  "},
+		{Name: "ws-user", Username: "  ", Password: "secret"},
+		{Name: "ws-pass", Username: "admin", Password: "  "},
+		{Name: "tok", Token: "tok-1"},
+		{Name: "basic", Username: "u", Password: "p"},
+		{Name: "basic-padded", Username: " u ", Password: " p "},
+		{Name: "dual", Token: "tok-1", Username: "u", Password: "p"},
+	}
+
+	for _, c := range samples {
+		wantUsable := c.Usable()
+		compiledUsable := !newCredentialSet([]config.Credential{c}).empty()
+		if wantUsable != compiledUsable {
+			t.Errorf("credential %+v: Usable()=%v but newCredentialSet non-empty=%v", c, wantUsable, compiledUsable)
 		}
-		if name != "basic-entry" {
-			t.Errorf("expected basic-entry to be reported, got %q", name)
-		}
-	})
+	}
 }

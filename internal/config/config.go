@@ -27,6 +27,24 @@ type Credential struct {
 	Password string
 }
 
+// Factors reports which authentication factors the credential carries.
+// It is the single definition of "usable". The Bearer token is trimmed before both this
+// blankness check and the digest comparison (RFC 6750's b64token cannot contain whitespace),
+// whereas Basic fields are only checked for blankness here and are otherwise compared
+// byte-for-byte, exactly as configured (RFC 7617 §2.1). The audit Name is not a factor; it is
+// trimmed independently when the credential set is compiled.
+func (c Credential) Factors() (hasToken, hasBasic bool) {
+	hasToken = strings.TrimSpace(c.Token) != ""
+	hasBasic = strings.TrimSpace(c.Username) != "" && strings.TrimSpace(c.Password) != ""
+	return hasToken, hasBasic
+}
+
+// Usable reports whether the credential carries at least one usable authentication factor.
+func (c Credential) Usable() bool {
+	hasToken, hasBasic := c.Factors()
+	return hasToken || hasBasic
+}
+
 // AuthConfig contains the accepted Webhook identities.
 //
 // There is exactly one credential source: the AUTH_CREDENTIALS JSON array. The former
@@ -37,11 +55,14 @@ type AuthConfig struct {
 	Credentials []Credential
 }
 
-// HasWebhookAuth reports whether at least one credential is configured. Credentials coming from
-// parseCredentials are always usable (at least one token or a complete Basic pair each), so a
-// non-empty list is exactly "the webhook can authenticate callers".
+// HasWebhookAuth reports whether at least one usable credential is configured.
 func (a AuthConfig) HasWebhookAuth() bool {
-	return len(a.Credentials) > 0
+	for _, c := range a.Credentials {
+		if c.Usable() {
+			return true
+		}
+	}
+	return false
 }
 
 // TelegramConfig contains credentials and endpoint for Telegram message dispatching.
@@ -62,11 +83,6 @@ func (c *TelegramConfig) HasPartialConfig() bool {
 		return false
 	}
 	return strings.TrimSpace(c.BotToken) != "" || c.ChatID != 0 || strings.TrimSpace(c.BaseURL) != ""
-}
-
-// IsPartial is an alias for HasPartialConfig.
-func (c *TelegramConfig) IsPartial() bool {
-	return c.HasPartialConfig()
 }
 
 // BarkConfig contains endpoints and device keys for Bark iOS dispatching.
@@ -101,12 +117,7 @@ func (c *EmailConfig) HasPartialConfig() bool {
 	if c == nil || c.Enabled() {
 		return false
 	}
-	return strings.TrimSpace(c.SenderEmail) != "" || strings.TrimSpace(c.ReceiverEmail) != "" || strings.TrimSpace(c.Password) != "" || strings.TrimSpace(c.SMTPServer) != ""
-}
-
-// IsPartial is an alias for HasPartialConfig.
-func (c *EmailConfig) IsPartial() bool {
-	return c.HasPartialConfig()
+	return strings.TrimSpace(c.SenderEmail) != "" || strings.TrimSpace(c.ReceiverEmail) != "" || strings.TrimSpace(c.Password) != "" || strings.TrimSpace(c.SMTPServer) != "" || c.SMTPPort != 0
 }
 
 // IMAPConfig contains IMAP configuration for incoming email triggers.
@@ -128,12 +139,7 @@ func (c *IMAPConfig) HasPartialConfig() bool {
 	if c == nil || c.Enabled() {
 		return false
 	}
-	return strings.TrimSpace(c.LoginEmail) != "" || strings.TrimSpace(c.Password) != "" || strings.TrimSpace(c.IMAPServer) != "" || strings.TrimSpace(c.Mailbox) != ""
-}
-
-// IsPartial is an alias for HasPartialConfig.
-func (c *IMAPConfig) IsPartial() bool {
-	return c.HasPartialConfig()
+	return strings.TrimSpace(c.LoginEmail) != "" || strings.TrimSpace(c.Password) != "" || strings.TrimSpace(c.IMAPServer) != "" || strings.TrimSpace(c.Mailbox) != "" || c.IMAPPort != 0
 }
 
 // RulesConfig holds JSON-parsed regex lists for message processing.
@@ -144,18 +150,42 @@ type RulesConfig struct {
 	Emergency   []string
 }
 
+// RunMode declares which ingress services push-transfer starts.
+type RunMode string
+
+const (
+	RunModeWebhook RunMode = "webhook"
+	RunModeIMAP    RunMode = "imap"
+	RunModeBoth    RunMode = "both"
+)
+
+// Valid reports whether m is one of the three supported run modes.
+func (m RunMode) Valid() bool {
+	return m == RunModeWebhook || m == RunModeIMAP || m == RunModeBoth
+}
+
+// StartsWebhook reports whether m starts the HTTP webhook server.
+func (m RunMode) StartsWebhook() bool {
+	return m == RunModeWebhook || m == RunModeBoth
+}
+
+// StartsIMAP reports whether m starts the IMAP email trigger listener.
+func (m RunMode) StartsIMAP() bool {
+	return m == RunModeIMAP || m == RunModeBoth
+}
+
 // Config represents the application configuration tree.
 // Optional channel configurations are nil when unconfigured.
 type Config struct {
-	Server     ServerConfig
-	Auth       AuthConfig
-	Bark       *BarkConfig
-	Telegram   *TelegramConfig
-	Email      *EmailConfig
-	IMAP       *IMAPConfig
-	Crypto     *CryptoConfig
-	Rules      RulesConfig
-	RunTrigger bool
+	Server   ServerConfig
+	Auth     AuthConfig
+	Bark     *BarkConfig
+	Telegram *TelegramConfig
+	Email    *EmailConfig
+	IMAP     *IMAPConfig
+	Crypto   *CryptoConfig
+	Rules    RulesConfig
+	RunMode  RunMode
 }
 
 // Load loads the configuration from system environment variables.
@@ -186,8 +216,10 @@ func LoadFromLookup(lookup func(string) string) (*Config, error) {
 	}
 	trustedProxies := parseCommaList(trustedProxiesRaw)
 
-	runTriggerStr := strings.TrimSpace(strings.ToLower(lookup("RUN_TRIGGER")))
-	runTrigger := runTriggerStr == "true" || runTriggerStr == "1"
+	mode := RunMode(strings.ToLower(strings.TrimSpace(lookup("RUN_MODE"))))
+	if mode != "" && !mode.Valid() {
+		return nil, fmt.Errorf("environment variable RUN_MODE must be one of webhook, imap, both, got %q", string(mode))
+	}
 
 	authCredsRaw := lookup("AUTH_CREDENTIALS")
 	authCreds, err := parseCredentials(authCredsRaw)
@@ -203,7 +235,7 @@ func LoadFromLookup(lookup func(string) string) (*Config, error) {
 		Auth: AuthConfig{
 			Credentials: authCreds,
 		},
-		RunTrigger: runTrigger,
+		RunMode: mode,
 	}
 
 	// 2. Telegram Config (Optional)
@@ -395,9 +427,8 @@ func parseJSONRegexList(val, name string) ([]string, error) {
 }
 
 const (
-	maxAuthCredentials       = 64
-	maxCredentialNameLen     = 64
-	reservedCredentialPrefix = "env:"
+	maxAuthCredentials   = 64
+	maxCredentialNameLen = 64
 )
 
 type credentialJSON struct {
@@ -413,7 +444,7 @@ type basicAuthPair struct {
 	password string
 }
 
-// parseCredentials strictly parses AUTH_CREDENTIALS (V1-V10 of the multi-credential contract).
+// parseCredentials strictly parses AUTH_CREDENTIALS (V1-V11 of the multi-credential contract).
 //
 // SECURITY: the raw value carries plaintext tokens and passwords, and every error returned here
 // is surfaced through slog by main(). Error messages therefore must never echo `raw`; they may
@@ -488,9 +519,6 @@ func parseCredentials(raw string) ([]Credential, error) {
 		name := fmt.Sprintf("credential-%d", entryNum)
 		if r.Name != nil {
 			name = strings.TrimSpace(*r.Name)
-			if strings.HasPrefix(name, reservedCredentialPrefix) {
-				return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS entry %d: \"name\" must not start with reserved prefix %q", entryNum, reservedCredentialPrefix)
-			}
 			if utf8.RuneCountInString(name) > maxCredentialNameLen {
 				return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS entry %d: \"name\" must not exceed %d characters", entryNum, maxCredentialNameLen)
 			}
@@ -512,8 +540,8 @@ func parseCredentials(raw string) ([]Credential, error) {
 			seenTokens[c.Token] = entryNum
 		}
 		if hasBasic {
-			c.Username = strings.TrimSpace(*r.Username)
-			c.Password = strings.TrimSpace(*r.Password)
+			c.Username = *r.Username
+			c.Password = *r.Password
 			pair := basicAuthPair{username: c.Username, password: c.Password}
 			if first, dup := seenBasics[pair]; dup {
 				return nil, fmt.Errorf("environment variable AUTH_CREDENTIALS entry %d: duplicate \"username\"/\"password\" pair already used by entry %d", entryNum, first)

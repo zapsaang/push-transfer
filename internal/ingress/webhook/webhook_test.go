@@ -86,6 +86,19 @@ func TestAuth_ExtractBearerToken(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("nil request returns empty string without panicking", func(t *testing.T) {
+		if got := webhook.ExtractBearerToken(nil); got != "" {
+			t.Errorf("ExtractBearerToken(nil) = %q; want empty", got)
+		}
+	})
+
+	// Regression guard (already safe via net/http Header.Get on nil map):
+	t.Run("zero http.Request with nil Header returns empty string", func(t *testing.T) {
+		if got := webhook.ExtractBearerToken(&http.Request{}); got != "" {
+			t.Errorf("ExtractBearerToken(&http.Request{}) = %q; want empty", got)
+		}
+	})
 }
 
 type mockProcessor struct {
@@ -635,94 +648,39 @@ func TestWebhook_RealIP(t *testing.T) {
 			t.Errorf("expected warning about invalid CIDR, got: %s", logs)
 		}
 	})
+
+	t.Run("nil request returns empty string without panicking", func(t *testing.T) {
+		if got := webhook.GetRealIP(nil); got != "" {
+			t.Errorf("GetRealIP(nil) = %q; want empty", got)
+		}
+	})
 }
 
-// TestWebhook_QueryTokenAuth covers the `?token=` authentication path that the
-// legacy clients use and that README documents.
-func TestWebhook_QueryTokenAuth(t *testing.T) {
+// TestWebhook_QueryTokenIsNotACredential pins that `?token=` in the URL query string is rejected
+// (D-13: credentials must never ride in URLs where proxies/gateways log them).
+func TestWebhook_QueryTokenIsNotACredential(t *testing.T) {
 	const validToken = "query-token-xyz"
+	h := webhook.NewHandler(webhook.HandlerOptions{
+		Credentials: []config.Credential{{Name: "dev", Token: validToken}},
+		Processor:   &mockProcessor{pass: true},
+		Deliverer:   &mockDeliverer{},
+	})
 
-	newHandler := func() *webhook.Handler {
-		return webhook.NewHandler(webhook.HandlerOptions{
-			Credentials: []config.Credential{{Token: validToken}},
-			Processor:   &mockProcessor{pass: true},
-			Deliverer:   &mockDeliverer{},
-		})
+	req := httptest.NewRequest(http.MethodPost, "/webhook?token="+validToken, bytes.NewBufferString(`{"msg_type":"text"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when token is only in query string, got %d (%s)", rec.Code, rec.Body.String())
 	}
 
-	t.Run("valid ?token= without Authorization header -> 200", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/webhook?token="+validToken, bytes.NewBufferString(`{"msg_type":"text"}`))
-		rec := httptest.NewRecorder()
-		newHandler().ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200 for a valid query token, got %d (%s)", rec.Code, rec.Body.String())
-		}
-	})
-
-	t.Run("wrong ?token= -> 401", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/webhook?token=wrong-token", bytes.NewBufferString(`{"msg_type":"text"}`))
-		rec := httptest.NewRecorder()
-		newHandler().ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401 for an invalid query token, got %d", rec.Code)
-		}
-	})
-
-	t.Run("empty or partial ?token= -> 401", func(t *testing.T) {
-		for _, query := range []string{"?token=", "?token=%20", "?TOKEN=" + validToken, "?token=" + validToken[:5]} {
-			req := httptest.NewRequest(http.MethodPost, "/webhook"+query, bytes.NewBufferString(`{"msg_type":"text"}`))
-			rec := httptest.NewRecorder()
-			newHandler().ServeHTTP(rec, req)
-
-			if rec.Code != http.StatusUnauthorized {
-				t.Errorf("query %q: expected 401, got %d", query, rec.Code)
-			}
-		}
-	})
-
-	t.Run("query token also works when Basic Auth is configured", func(t *testing.T) {
-		h := webhook.NewHandler(webhook.HandlerOptions{
-			Credentials: []config.Credential{
-				{Token: validToken},
-				{Username: "admin", Password: "secret"},
-			},
-			Processor: &mockProcessor{pass: true},
-			Deliverer: &mockDeliverer{},
-		})
-
-		req := httptest.NewRequest(http.MethodPost, "/webhook?token="+validToken, bytes.NewBufferString(`{"msg_type":"text"}`))
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200 for a valid query token with Basic Auth enabled, got %d", rec.Code)
-		}
-	})
-
-	t.Run("no credentials configured -> query token is irrelevant and access is denied", func(t *testing.T) {
-		h := webhook.NewHandler(webhook.HandlerOptions{
-			Processor: &mockProcessor{pass: true},
-			Deliverer: &mockDeliverer{},
-		})
-		req := httptest.NewRequest(http.MethodPost, "/webhook?token=anything", bytes.NewBufferString(`{"msg_type":"text"}`))
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("expected fail-closed 401 when no credential is configured, got %d", rec.Code)
-		}
-	})
-
-	t.Run("nil request or nil URL is handled defensively", func(t *testing.T) {
-		if got := webhook.ExtractQueryToken(nil); got != "" {
-			t.Errorf("expected an empty token for a nil request, got %q", got)
-		}
-		if got := webhook.ExtractQueryToken(&http.Request{}); got != "" {
-			t.Errorf("expected an empty token for a request without a URL, got %q", got)
-		}
-	})
+	// Regression guard: the same token in Authorization: Bearer must still succeed.
+	reqOK := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+	reqOK.Header.Set("Authorization", "Bearer "+validToken)
+	recOK := httptest.NewRecorder()
+	h.ServeHTTP(recOK, reqOK)
+	if recOK.Code != http.StatusOK {
+		t.Fatalf("expected 200 for Authorization: Bearer, got %d", recOK.Code)
+	}
 }
 
 // TestWebhook_UnauthorizedChallenge verifies the WWW-Authenticate challenge required
@@ -782,15 +740,6 @@ func TestWebhook_MultiCredentialAuth(t *testing.T) {
 	t.Run("bearer tok-a -> 200", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
 		req.Header.Set("Authorization", "Bearer tok-a")
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", rec.Code)
-		}
-	})
-
-	t.Run("query ?token=tok-a -> 200", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/webhook?token=tok-a", bytes.NewBufferString(`{"msg_type":"text"}`))
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
@@ -899,7 +848,6 @@ func TestWebhook_NoCredentialsIsFailClosed(t *testing.T) {
 			}{
 				{"no auth", func(_ *http.Request) {}},
 				{"with bearer", func(r *http.Request) { r.Header.Set("Authorization", "Bearer anything") }},
-				{"with query token", func(r *http.Request) { r.URL.RawQuery = "token=anything" }},
 				{"with basic auth", func(r *http.Request) { r.SetBasicAuth("admin", "admin") }},
 			} {
 				req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
@@ -933,7 +881,6 @@ func TestWebhook_DeclaredButBlankFailClosed(t *testing.T) {
 	}{
 		{"no auth", func(_ *http.Request) {}},
 		{"with bearer", func(r *http.Request) { r.Header.Set("Authorization", "Bearer anything") }},
-		{"with query token", func(r *http.Request) { r.URL.RawQuery = "token=anything" }},
 		{"with basic auth", func(r *http.Request) { r.SetBasicAuth("admin", "admin") }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -950,8 +897,8 @@ func TestWebhook_DeclaredButBlankFailClosed(t *testing.T) {
 }
 
 // TestWebhook_AuthorizedAuditLog pins the audit contract of the multi-credential design:
-// a successful authentication records exactly the credential name (never the secret), and an
-// open-access deployment (no credentials declared) records no authorization line at all.
+// a successful authentication records exactly the credential name (never the secret), and a
+// credential-less handler is fail-closed: it warns once and never records an authorization line.
 func TestWebhook_AuthorizedAuditLog(t *testing.T) {
 	newLogger := func(buf *bytes.Buffer) *slog.Logger {
 		return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -1028,6 +975,29 @@ func TestWebhook_AuthorizedAuditLog(t *testing.T) {
 		logs := buf.String()
 		if strings.Contains(logs, "credential=phone-a") || strings.Contains(logs, "webhook authorized") {
 			t.Errorf("failed auth must not log an authorization line, got:\n%s", logs)
+		}
+	})
+
+	t.Run("whitespace-only credential name is trimmed and suppresses authorization log line", func(t *testing.T) {
+		var buf bytes.Buffer
+		h := webhook.NewHandler(webhook.HandlerOptions{
+			Credentials: []config.Credential{{Name: "   ", Token: "tok-ws"}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
+			Logger:      newLogger(&buf),
+		})
+
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+		req.Header.Set("Authorization", "Bearer tok-ws")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		logs := buf.String()
+		if strings.Contains(logs, `credential="   "`) || strings.Contains(logs, "webhook authorized") {
+			t.Errorf("whitespace-only Name must not produce blank credential audit log, got:\n%s", logs)
 		}
 	})
 }

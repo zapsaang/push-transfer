@@ -42,25 +42,21 @@ func newCredentialSet(creds []config.Credential) *credentialSet {
 		eq: constantTimeEqual,
 	}
 	for _, c := range creds {
-		token := strings.TrimSpace(c.Token)
-		user := strings.TrimSpace(c.Username)
-		pass := strings.TrimSpace(c.Password)
-		hasToken := token != ""
-		hasBasic := user != "" && pass != ""
+		hasToken, hasBasic := c.Factors()
 		if !hasToken && !hasBasic {
 			continue
 		}
 		cc := compiledCredential{
-			name:     c.Name,
+			name:     strings.TrimSpace(c.Name),
 			hasToken: hasToken,
 			hasBasic: hasBasic,
 		}
 		if hasToken {
-			cc.token = digestOf(token)
+			cc.token = digestOf(strings.TrimSpace(c.Token))
 		}
 		if hasBasic {
-			cc.user = digestOf(user)
-			cc.pass = digestOf(pass)
+			cc.user = digestOf(c.Username)
+			cc.pass = digestOf(c.Password)
 			set.hasBasicAuth = true
 		}
 		set.creds = append(set.creds, cc)
@@ -73,7 +69,7 @@ func (s *credentialSet) empty() bool {
 }
 
 func (s *credentialSet) verify(r *http.Request) (name string, ok bool) {
-	if s == nil || len(s.creds) == 0 {
+	if s == nil || len(s.creds) == 0 || r == nil {
 		return "", false
 	}
 	eq := s.eq
@@ -81,9 +77,8 @@ func (s *credentialSet) verify(r *http.Request) (name string, ok bool) {
 		eq = constantTimeEqual
 	}
 
-	// Fixed 4 hashes, not short-circuited by unconfigured credential types.
+	// Fixed 3 hashes, not short-circuited by unconfigured credential types.
 	bearer := digestOf(ExtractBearerToken(r))
-	query := digestOf(ExtractQueryToken(r))
 	user, pass, _ := r.BasicAuth() // hashed even when headers are missing
 	uh, ph := digestOf(user), digestOf(pass)
 
@@ -93,7 +88,7 @@ func (s *credentialSet) verify(r *http.Request) (name string, ok bool) {
 		hit := 0
 		if c.hasToken {
 			// Integer bitwise ops: no short-circuit evaluation
-			hit |= eq(bearer, c.token) | eq(query, c.token)
+			hit |= eq(bearer, c.token)
 		}
 		if c.hasBasic {
 			// AND within same entry: prevents cross-credential combination
@@ -110,6 +105,9 @@ func (s *credentialSet) verify(r *http.Request) (name string, ok bool) {
 // ExtractBearerToken extracts the bearer token from the Authorization header,
 // supporting multiple spaces or tab separation between "Bearer" and the token.
 func ExtractBearerToken(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
 	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
 	if authHeader == "" {
 		return ""
@@ -125,17 +123,4 @@ func ExtractBearerToken(r *http.Request) string {
 	}
 
 	return strings.TrimSpace(rest)
-}
-
-// ExtractQueryToken returns the `token` query parameter.
-//
-// It exists for compatibility with the legacy clients (the removed Python
-// implementation read the same parameter) and is documented in README as an
-// alternative to the Authorization header. Callers must compare the result in
-// constant time.
-func ExtractQueryToken(r *http.Request) string {
-	if r == nil || r.URL == nil {
-		return ""
-	}
-	return strings.TrimSpace(r.URL.Query().Get("token"))
 }

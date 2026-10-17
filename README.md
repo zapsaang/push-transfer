@@ -100,7 +100,13 @@ cd push-transfer
 # 2. 编译二进制
 go build -ldflags="-s -w" -o push-transfer ./cmd/push-transfer
 
-# 3. 启动服务（默认监听 8889 端口，无外部通道时默认回显至控制台）
+# 3. 显式选择运行模式（必填：webhook | imap | both）
+export RUN_MODE=webhook
+
+# 4. 配置一个仅用于本地演示的凭据（不要用于生产）
+export AUTH_CREDENTIALS='[{"name":"dev","token":"dev-token-change-me"}]'
+
+# 5. 启动服务（默认监听 8889 端口，无外部通道时默认回显至控制台）
 ./push-transfer
 ```
 
@@ -109,6 +115,7 @@ go build -ldflags="-s -w" -o push-transfer ./cmd/push-transfer
 ```bash
 curl -X POST http://localhost:8889/webhook \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dev-token-change-me" \
   -d '{
     "msg_type": "text",
     "title": "10086",
@@ -121,10 +128,13 @@ curl -X POST http://localhost:8889/webhook \
 
 ```text
 time=2026-10-16T20:53:36.606+08:00 level=INFO msg="incoming request" ip=127.0.0.1 method=POST path=/webhook
+time=2026-10-16T20:53:36.606+08:00 level=INFO msg="webhook authorized" ip=127.0.0.1 credential=dev
 time=2026-10-16T20:53:36.606+08:00 level=INFO msg="console deliver" msg_type=text title=10086 content="【中国移动】您的验证码是 889900，请勿泄露给他人。" captcha="" emergency=false text="【中国移动】您的验证码是 889900，请勿泄露给他人。\n\n短信来自: 10086\n\n发送时间：2024-10-15 21:46:40\n转发时间：2024-10-15 21:46:40\n"
 ```
 
-> 上述 `captcha` 为空是因为快速开始未配置任何 `REGEX_*` 规则；配置 `REGEX_CAPTCHA` 后该字段会填入提取到的验证码。
+> - `RUN_MODE` 必填，未设置或非法值 fail-fast，不会猜测模式。
+> - `/healthz` **仅在** `webhook` / `both` 模式下提供；`imap` 模式不监听任何 HTTP。
+> - 本网关不存在无鉴权服务模式；上述 `captcha` 为空是因为快速开始未配置任何 `REGEX_*` 规则，配置 `REGEX_CAPTCHA` 后该字段会填入提取到的验证码。
 
 ---
 
@@ -204,6 +214,7 @@ docker run -d \
 CGO_ENABLED=0 go build -ldflags="-s -w" -o push-transfer ./cmd/push-transfer
 
 # 指定环境变量或导出 .env 后运行
+export RUN_MODE=webhook
 export PORT=8889
 export AUTH_CREDENTIALS='[{"name":"phone-a","token":"your_secure_token"}]'
 export BARK_DEVICE_KEY_LIST="your_bark_device_key"
@@ -278,13 +289,13 @@ PushTransfer 遵循 **12-Factor 原则**，所有配置均通过环境变量进�
 #### 1. 服务监听与运行模式
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
-| `PORT` | `8889` | HTTP Webhook 服务监听端口（兼容别名 `SERVER_PORT`） |
-| `RUN_TRIGGER` | `false` | 是否开启 IMAP 邮件触发器后台监听（`true` 或 `1` 启用）。Webhook **绝不以无鉴权方式提供服务**：未配置 `AUTH_CREDENTIALS` 且 `RUN_TRIGGER` 不为 `true` 时进程启动即报错退出；只有 `RUN_TRIGGER=true`（纯 IMAP 模式，不监听 HTTP）才允许无凭据运行 |
+| `RUN_MODE` | _(必填，无默认)_ | 进程运行模式枚举（大小写不敏感，三选一）：<br>• `webhook`：只启动 HTTP 服务（`/webhook` + `/healthz`），要求 `AUTH_CREDENTIALS` 含至少一条可用凭据，忽略 `EMAIL_TRIGGER_*`（若存在则输出 `WARN`）<br>• `imap`：只启动 IMAP 后台监听，**不监听任何 HTTP 端口**，要求完整 `EMAIL_TRIGGER_LOGIN_EMAIL` + `EMAIL_TRIGGER_PASSWORD`，且若同时配置了 `AUTH_CREDENTIALS` 会 fail-fast 报错<br>• `both`：同时启动 HTTP 服务与 IMAP 监听，要求凭据与完整 IMAP 配置同时具备<br>未设置或传入其他值（含旧版 `RUN_TRIGGER` 布尔值）时启动即报错退出 |
+| `PORT` | `8889` | HTTP Webhook 服务监听端口（兼容别名 `SERVER_PORT`；仅 `RUN_MODE=webhook` 或 `both` 时生效） |
 
 #### 2. Webhook 接入鉴权与网络代理
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
-| `AUTH_CREDENTIALS` | _(空)_ | **唯一**凭据来源：单行严格 JSON 数组，每项支持 `name`（审计标识）、`token`、`username`、`password`。同一 token 或同一组 username+password 只能出现一次，重复即启动报错。未配置且 `RUN_TRIGGER` 不为 `true` 时启动失败。详见[多凭据接入配置](#2-多凭据接入配置-auth_credentials) |
+| `AUTH_CREDENTIALS` | _(空)_ | **唯一**凭据来源：单行严格 JSON 数组，每项支持 `name`（审计标识）、`token`、`username`、`password`。同一 token 或同一组 username+password 只能出现一次，重复即启动报错。`RUN_MODE=webhook` 或 `both` 时必填；`RUN_MODE=imap` 时禁止配置。详见[多凭据接入配置](#2-多凭据接入配置-auth_credentials) |
 | `TRUSTED_PROXIES` | _(空)_ | 信任的反向代理 IP 或 CIDR 列表（逗号分隔，如 `10.0.0.0/8,192.168.1.1`，兼容别名 `WEBHOOK_TRUSTED_PROXIES`）。默认已自动信任 Loopback 与 RFC 1918 私网地址。仅当直连对端属于受信代理时才解析 `X-Forwarded-For`/`X-Real-IP`，并从右向左跳过受信代理取第一个非受信地址，避免客户端伪造 |
 
 #### 3. Bark 投递通道
@@ -311,7 +322,7 @@ PushTransfer 遵循 **12-Factor 原则**，所有配置均通过环境变量进�
 | `EMAIL_DELIVER_SMTP_SERVER` | `smtp.exmail.qq.com` | SMTP 服务器域名 |
 | `EMAIL_DELIVER_SMTP_PORT` | `465` | SMTP SSL 端口 |
 
-#### 6. 邮件触发通道 (IMAP SSL，需配合 `RUN_TRIGGER=true`)
+#### 6. 邮件触发通道 (IMAP SSL，需 `RUN_MODE=imap` 或 `both`)
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `EMAIL_TRIGGER_LOGIN_EMAIL` | _(空)_ | IMAP 登录邮箱地址 |
@@ -415,7 +426,7 @@ Authorization: Bearer <你的 token>   # AUTH_CREDENTIALS 中某个条目的 tok
 | `200 OK` | `{"status":"success"}` | 消息处理并通过流水线，已成功投递下游 |
 | `200 OK` | `{"status":"blocked"}` | 消息命中黑名单规则，已被网关正常拦截过滤 |
 | `400 Bad Request` | `{"status":"failed","message":"invalid json"}` | 报文不是合法的 JSON 格式 |
-| `401 Unauthorized`| `{"status":"failed","message":"unauthorized"}` | Bearer Token / Query Token / Basic Auth 认证失败（配置 Basic Auth 时附带 `WWW-Authenticate: Basic` 质询；多凭据下响应不区分具体失败凭据以避免枚举） |
+| `401 Unauthorized`| `{"status":"failed","message":"unauthorized"}` | Bearer Token / Basic Auth 认证失败（配置 Basic Auth 时附带 `WWW-Authenticate: Basic` 质询；多凭据下响应不区分具体失败凭据以避免枚举） |
 | `405 Method Not Allowed` | `{"status":"failed","message":"method not allowed"}` | 请求方法不为 `POST` |
 | `413 Request Entity Too Large` | `{"status":"failed","message":"request body too large"}` | 请求体体积超过 1MB 上限 |
 | `500 Internal Server Error` | `{"status":"failed","message":"process failed"}` | 规则流水线执行失败（如正则匹配超时熔断） |
@@ -432,9 +443,10 @@ AUTH_CREDENTIALS='[{"name":"phone-a","token":"random-token-1"},{"name":"tablet",
 ```
 
 - **配置契约与字段**：
-  - `name`：可选的审计标识，进入结构化审计日志以区分来源设备（如 `level=INFO msg="webhook authorized" ip=... credential=phone-a`）。切勿在 `name` 中包含密码或敏感信息。若缺省则自动命名为 `credential-N`（1-based 序号）；`name` 最大 64 字符且**禁止以保留前缀 `env:` 开头**。
-  - `token`：Bearer Token / 查询参数 Token（可选，与 Basic Auth 至少提供一项）。
+  - `name`：可选的审计标识，进入结构化审计日志以区分来源设备（如 `level=INFO msg="webhook authorized" ip=... credential=phone-a`）。切勿在 `name` 中包含密码或敏感信息。若缺省则自动命名为 `credential-N`（1-based 序号）；`name` 最大 64 字符。
+  - `token`：Bearer Token（可选，与 Basic Auth 至少提供一项；仅接受 `Authorization: Bearer <token>` 请求头，不支持 `?token=` 查询参数）。
   - `username` 与 `password`：HTTP Basic Auth 凭据对，必须成对配置（若仅配置其中一项将报启动错误）。
+  - **空白规范化契约**：`name` 与 `token` 会剥离首尾空白；Basic 的 `username`/`password` 按字节原样保存并逐字节比对（RFC 7617 §2.1），客户端必须发送完全相同的值；纯空白字段仍按 V5 拒绝。
   - 每个认证要素必须是**唯一**的：同一个 `token`，或同一组 `username`+`password`，在数组里只能出现一次；重复会在启动时报错，因为一个密钥只能对应一个审计身份，静默去重会让日志出现二义性。
 - **校验硬约束（Fail-Fast）**：
   - JSON 必须严格格式化，不支持未知字段或尾随字符；
@@ -443,9 +455,9 @@ AUTH_CREDENTIALS='[{"name":"phone-a","token":"random-token-1"},{"name":"tablet",
   - 环境变量必须写在**单行**内，避免被容器或 shell 分行注入截断；
   - 启动校验失败时报错信息只包含变量名、条目序号与出错字段，**绝不回显凭据内容**（避免密钥进入日志）。
 - **无隐式开放入口**：
-  - 进程若需要对外提供 Webhook（即 `RUN_TRIGGER` 不为 `true`），就必须配置 `AUTH_CREDENTIALS`，否则**启动即失败退出**，不会以无鉴权方式监听端口。
-  - 唯一允许无凭据运行的模式是纯 IMAP 模式：`RUN_TRIGGER=true`（不监听 HTTP）。
-  - 旧版的 `AUTH_TOKEN` / `AUTH_USERNAME` / `AUTH_PASSWORD` 已**移除**，不再被读取；请把它们迁移成 `AUTH_CREDENTIALS` 中的一个条目，例如 `[{"name":"legacy","token":"<原 AUTH_TOKEN 值>"}]`。
+  - 进程若需要对外提供 Webhook（即 `RUN_MODE=webhook` 或 `RUN_MODE=both`），就必须配置 `AUTH_CREDENTIALS`，否则**启动即失败退出**，不会以无鉴权方式监听端口。
+  - 唯一允许无凭据运行的模式是纯 IMAP 模式：`RUN_MODE=imap`（不监听 HTTP；此时若传入 `AUTH_CREDENTIALS` 同样会 fail-fast 报错，提示改用 `RUN_MODE=both` 或移除未使用的凭据）。
+  - 旧版的 `RUN_TRIGGER` / `AUTH_TOKEN` / `AUTH_USERNAME` / `AUTH_PASSWORD` 已**移除**，不再被读取；请显式设置 `RUN_MODE`，并把旧凭据迁移成 `AUTH_CREDENTIALS` 中的一个条目，例如 `[{"name":"legacy","token":"<原 AUTH_TOKEN 值>"}]`。
   - 建议为每台设备颁发独立 Token，便于凭据轮换与日志来源审计。
 - **恒定时间安全保障**：
   - 无论配置多少组凭据，鉴权引擎均以 SHA-256 预计算摘要并在请求到达时进行全量扫描比对（无提前 return 短路），杜绝时序攻击（Timing Attack）。
@@ -496,7 +508,7 @@ AUTH_CREDENTIALS='[{"name":"phone-a","token":"random-token-1"},{"name":"tablet",
 
 1. 在 `.env` 中设置：
    ```env
-   RUN_TRIGGER=true
+   RUN_MODE=imap
    EMAIL_TRIGGER_LOGIN_EMAIL=your_worker_email@example.com
    EMAIL_TRIGGER_PASSWORD=your_imap_password
    EMAIL_TRIGGER_IMAP_SERVER=imap.example.com
@@ -514,14 +526,14 @@ AUTH_CREDENTIALS='[{"name":"phone-a","token":"random-token-1"},{"name":"tablet",
 
 ### 健康检查接口
 
-网关提供专门的存活检测路由，适用于 Docker 容器健康检查或 K8s Liveness 探针：
+在 `RUN_MODE=webhook` 或 `RUN_MODE=both` 模式下，网关提供专门的存活检测路由，适用于 Docker 容器健康检查或 K8s Liveness 探针（注意：`RUN_MODE=imap` 纯邮件触发模式**不监听任何 HTTP 端口**，不提供 `/healthz`）：
 
 ```bash
 curl http://localhost:8889/healthz
 # 正常返回: {"status":"ok"}，HTTP 200
 ```
 
-Docker Compose 中增加健康检查示例：
+Docker Compose 中增加健康检查示例（仅适用于 `RUN_MODE=webhook` 或 `both`）：
 ```yaml
 healthcheck:
   test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8889/healthz || exit 1"]

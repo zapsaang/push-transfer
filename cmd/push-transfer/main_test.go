@@ -200,6 +200,7 @@ func TestRun_FullE2E_WebhookFlow(t *testing.T) {
 	const authToken = "secret-token-e2e-2026"
 	envMap := map[string]string{
 		"PORT":                 "0", // Assign ephemeral OS port
+		"RUN_MODE":             "webhook",
 		"AUTH_CREDENTIALS":     credentialEnv("e2e", authToken),
 		"BARK_DEVICE_KEY_LIST": "bark-test-device-key",
 		"BARK_POST_URL":        mockBark.URL + "/push",
@@ -513,32 +514,57 @@ func TestRun_FullE2E_WebhookFlow(t *testing.T) {
 func TestRun_ConfigErrors(t *testing.T) {
 	t.Run("invalid port configuration", func(t *testing.T) {
 		env := map[string]string{
-			"PORT": "invalid-port",
+			"RUN_MODE": "webhook",
+			"PORT":     "invalid-port",
 		}
 		err := run(context.Background(), nil, io.Discard, func(k string) string { return env[k] })
 		if err == nil {
 			t.Fatal("expected error with invalid port, got nil")
 		}
+		if !strings.Contains(err.Error(), "PORT") {
+			t.Errorf("expected error to mention PORT, got: %v", err)
+		}
 	})
 
 	t.Run("invalid regex configuration", func(t *testing.T) {
 		env := map[string]string{
+			"RUN_MODE":           "webhook",
+			"AUTH_CREDENTIALS":   credentialEnv("probe", "token"),
 			"REGEX_FILTER_BLACK": `["[unclosed-bracket"]`,
 		}
 		err := run(context.Background(), nil, io.Discard, func(k string) string { return env[k] })
 		if err == nil {
 			t.Fatal("expected error with invalid regex, got nil")
 		}
+		if !strings.Contains(err.Error(), "failed to initialize processing pipeline") {
+			t.Errorf("expected pipeline initialization error, got: %v", err)
+		}
 	})
 
-	t.Run("no services configured", func(t *testing.T) {
+	t.Run("both mode missing IMAP and credentials", func(t *testing.T) {
 		env := map[string]string{
-			"RUN_TRIGGER": "true",
-			// IMAP not configured and Token empty
+			"RUN_MODE": "both",
+			// IMAP not configured and AUTH_CREDENTIALS unset
 		}
 		err := run(context.Background(), nil, io.Discard, func(k string) string { return env[k] })
 		if err == nil {
-			t.Fatal("expected error when no services configured, got nil")
+			t.Fatal("expected error when RUN_MODE=both has no credentials/IMAP, got nil")
+		}
+		if !strings.Contains(err.Error(), "RUN_MODE=both") {
+			t.Errorf("expected error to mention RUN_MODE=both, got: %v", err)
+		}
+	})
+
+	t.Run("invalid RUN_MODE value", func(t *testing.T) {
+		env := map[string]string{
+			"RUN_MODE": "yes",
+		}
+		err := run(context.Background(), nil, io.Discard, func(k string) string { return env[k] })
+		if err == nil {
+			t.Fatal("expected error for invalid RUN_MODE, got nil")
+		}
+		if !strings.Contains(err.Error(), "RUN_MODE must be one of webhook, imap, both") {
+			t.Errorf("expected RUN_MODE validation error, got: %v", err)
 		}
 	})
 
@@ -552,16 +578,21 @@ func TestRun_ConfigErrors(t *testing.T) {
 		_, portStr, _ := net.SplitHostPort(ln.Addr().String())
 		env := map[string]string{
 			"PORT":             portStr,
+			"RUN_MODE":         "webhook",
 			"AUTH_CREDENTIALS": credentialEnv("probe", "token"),
 		}
 		err = run(context.Background(), nil, io.Discard, func(k string) string { return env[k] })
 		if err == nil {
 			t.Fatal("expected error on port collision, got nil")
 		}
+		if !strings.Contains(err.Error(), "failed to bind HTTP server") {
+			t.Errorf("expected port bind error, got: %v", err)
+		}
 	})
 
 	t.Run("invalid AUTH_CREDENTIALS configuration", func(t *testing.T) {
 		env := map[string]string{
+			"RUN_MODE":         "webhook",
 			"AUTH_CREDENTIALS": `[{"token":"   "}]`,
 		}
 		err := run(context.Background(), nil, io.Discard, func(k string) string { return env[k] })
@@ -576,6 +607,7 @@ func TestRun_ConfigErrors(t *testing.T) {
 	t.Run("malformed AUTH_CREDENTIALS failure never echoes credential material", func(t *testing.T) {
 		const secret = "leaked-startup-secret"
 		env := map[string]string{
+			"RUN_MODE":         "webhook",
 			"AUTH_CREDENTIALS": `[{"token":"` + secret + `"}] trailing`,
 		}
 		err := run(context.Background(), nil, io.Discard, func(k string) string { return env[k] })
@@ -589,17 +621,6 @@ func TestRun_ConfigErrors(t *testing.T) {
 			t.Errorf("expected startup error to name the offending variable, got: %v", err)
 		}
 	})
-
-	t.Run("trigger enabled without IMAP configured", func(_ *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		env := map[string]string{
-			"RUN_TRIGGER":      "true",
-			"AUTH_CREDENTIALS": credentialEnv("probe", "token"),
-			"PORT":             "0",
-		}
-		_ = run(ctx, nil, io.Discard, func(k string) string { return env[k] })
-	})
 }
 
 func TestRun_IMAPTriggerFlow(t *testing.T) {
@@ -608,7 +629,7 @@ func TestRun_IMAPTriggerFlow(t *testing.T) {
 	cancel()
 
 	env := map[string]string{
-		"RUN_TRIGGER":               "true",
+		"RUN_MODE":                  "imap",
 		"EMAIL_TRIGGER_LOGIN_EMAIL": "test@example.com",
 		"EMAIL_TRIGGER_PASSWORD":    "secret",
 		"EMAIL_TRIGGER_IMAP_SERVER": "127.0.0.1",
@@ -679,6 +700,7 @@ func TestRun_HTTPServerGoroutineTrackedInWaitGroup(t *testing.T) {
 
 	env := map[string]string{
 		"PORT":             "0",
+		"RUN_MODE":         "webhook",
 		"AUTH_CREDENTIALS": credentialEnv("wg", "waitgroup-token"),
 	}
 	lookup := func(k string) string { return env[k] }
@@ -791,13 +813,14 @@ func TestBuildDispatcher_PartialConfigWarnings(t *testing.T) {
 		}
 	})
 
-	t.Run("run logs all partial config warnings including partial IMAP", func(t *testing.T) {
+	t.Run("run logs all partial config warnings including ignored partial IMAP in webhook mode", func(t *testing.T) {
 		var buf bytes.Buffer
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
 		env := map[string]string{
 			"PORT":                       "0",
+			"RUN_MODE":                   "webhook",
 			"AUTH_CREDENTIALS":           credentialEnv("valid", "valid-token"),
 			"EMAIL_TRIGGER_LOGIN_EMAIL":  "only-imap-user@example.com",
 			"TELEGRAM_BOT_TOKEN":         "only-tg-token",
@@ -813,7 +836,7 @@ func TestBuildDispatcher_PartialConfigWarnings(t *testing.T) {
 		logs := buf.String()
 		expectedWarnings := []string{
 			"AES_128_ECB_IV is deprecated and ignored; random IV is generated per message",
-			"partial IMAP trigger configuration detected; IMAP listener will not start unless all required fields are set",
+			"IMAP configuration is present but ignored: RUN_MODE=webhook does not start the IMAP listener; use RUN_MODE=both",
 			"partial telegram configuration detected; telegram target disabled",
 			"partial email configuration detected; email target disabled",
 		}
@@ -824,16 +847,20 @@ func TestBuildDispatcher_PartialConfigWarnings(t *testing.T) {
 		}
 	})
 
-	t.Run("webhook starts and authenticates with Basic Auth when RUN_TRIGGER=true and only Basic Auth is configured", func(t *testing.T) {
+	t.Run("webhook and IMAP both start and authenticate with Basic Auth under RUN_MODE=both", func(t *testing.T) {
 		var buf bytes.Buffer
 		readyCh := make(chan string, 1)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		env := map[string]string{
-			"PORT":             "0",
-			"RUN_TRIGGER":      "true",
-			"AUTH_CREDENTIALS": basicCredentialEnv("webhook-basic", "webhook-admin", "webhook-password"),
+			"PORT":                      "0",
+			"RUN_MODE":                  "both",
+			"AUTH_CREDENTIALS":          basicCredentialEnv("webhook-basic", "webhook-admin", "webhook-password"),
+			"EMAIL_TRIGGER_LOGIN_EMAIL": "test@example.com",
+			"EMAIL_TRIGGER_PASSWORD":    "secret",
+			"EMAIL_TRIGGER_IMAP_SERVER": "127.0.0.1",
+			"EMAIL_TRIGGER_IMAP_PORT":   "0",
 		}
 		lookup := func(k string) string { return env[k] }
 
@@ -887,11 +914,13 @@ func TestRun_ConcurrentIsolatedLoggers(t *testing.T) {
 
 	env1 := map[string]string{
 		"PORT":                 "0",
+		"RUN_MODE":             "webhook",
 		"AUTH_CREDENTIALS":     credentialEnv("i1", "token-instance-1"),
 		"BARK_DEVICE_KEY_LIST": "instance-1-bark-key",
 	}
 	env2 := map[string]string{
 		"PORT":               "0",
+		"RUN_MODE":           "webhook",
 		"AUTH_CREDENTIALS":   credentialEnv("i2", "token-instance-2"),
 		"TELEGRAM_BOT_TOKEN": "instance-2-tg-token",
 		"TELEGRAM_CHAT_ID":   "777888999",
@@ -962,6 +991,7 @@ func TestRun_TrustedProxiesAndPipelineLoggerWired(t *testing.T) {
 	// and configure REGEX_FILTER_BLACK to trigger pipeline filter logging.
 	env := map[string]string{
 		"PORT":               "0",
+		"RUN_MODE":           "webhook",
 		"AUTH_CREDENTIALS":   credentialEnv("wired", "wired-test-token"),
 		"TRUSTED_PROXIES":    "198.51.100.0/24",
 		"REGEX_FILTER_BLACK": `["^blocked_word"]`,
@@ -1017,45 +1047,98 @@ func TestRun_TrustedProxiesAndPipelineLoggerWired(t *testing.T) {
 	}
 }
 
-func TestRun_MultiCredentialKeepsWebhookEnabledUnderRunTrigger(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func TestResolveRunModes(t *testing.T) {
+	validCreds := config.AuthConfig{Credentials: []config.Credential{{Name: "dev", Token: "tok"}}}
+	validIMAP := &config.IMAPConfig{LoginEmail: "u@example.com", Password: "p"}
+	partialIMAP := &config.IMAPConfig{LoginEmail: "u@example.com"}
 
-	var buf bytes.Buffer
-	readyCh := make(chan string, 1)
-
-	env := map[string]string{
-		"PORT":             "0",
-		"RUN_TRIGGER":      "true",
-		"AUTH_CREDENTIALS": `[{"name":"dev1","token":"my-tok"}]`,
+	cases := []struct {
+		name        string
+		cfg         *config.Config
+		wantModes   runModes
+		wantErrSubs string
+	}{
+		{
+			name:      "row 1a: webhook + credentials + no IMAP",
+			cfg:       &config.Config{RunMode: config.RunModeWebhook, Auth: validCreds},
+			wantModes: runModes{Webhook: true, IMAP: false},
+		},
+		{
+			name:      "row 1b: webhook + credentials + full IMAP (ignored)",
+			cfg:       &config.Config{RunMode: config.RunModeWebhook, Auth: validCreds, IMAP: validIMAP},
+			wantModes: runModes{Webhook: true, IMAP: false},
+		},
+		{
+			name:        "row 2: webhook without credentials -> fail-fast",
+			cfg:         &config.Config{RunMode: config.RunModeWebhook, IMAP: validIMAP},
+			wantErrSubs: "RUN_MODE=webhook requires AUTH_CREDENTIALS",
+		},
+		{
+			name:      "row 3: imap + full IMAP + no credentials",
+			cfg:       &config.Config{RunMode: config.RunModeIMAP, IMAP: validIMAP},
+			wantModes: runModes{Webhook: false, IMAP: true},
+		},
+		{
+			name:        "row 4: imap + incomplete IMAP -> fail-fast",
+			cfg:         &config.Config{RunMode: config.RunModeIMAP, IMAP: partialIMAP},
+			wantErrSubs: "RUN_MODE=imap requires EMAIL_TRIGGER_LOGIN_EMAIL and EMAIL_TRIGGER_PASSWORD",
+		},
+		{
+			name:        "row 5: imap + credentials -> fail-fast",
+			cfg:         &config.Config{RunMode: config.RunModeIMAP, Auth: validCreds, IMAP: validIMAP},
+			wantErrSubs: "AUTH_CREDENTIALS is not used with RUN_MODE=imap",
+		},
+		{
+			name:      "row 6: both + credentials + full IMAP",
+			cfg:       &config.Config{RunMode: config.RunModeBoth, Auth: validCreds, IMAP: validIMAP},
+			wantModes: runModes{Webhook: true, IMAP: true},
+		},
+		{
+			name:        "row 7: both without credentials -> fail-fast",
+			cfg:         &config.Config{RunMode: config.RunModeBoth, IMAP: validIMAP},
+			wantErrSubs: "RUN_MODE=both requires AUTH_CREDENTIALS",
+		},
+		{
+			name:        "row 8: both without complete IMAP -> fail-fast",
+			cfg:         &config.Config{RunMode: config.RunModeBoth, Auth: validCreds, IMAP: partialIMAP},
+			wantErrSubs: "RUN_MODE=both requires EMAIL_TRIGGER_LOGIN_EMAIL and EMAIL_TRIGGER_PASSWORD",
+		},
+		{
+			name:        "row 9a: unset RUN_MODE -> fail-fast",
+			cfg:         &config.Config{Auth: validCreds, IMAP: validIMAP},
+			wantErrSubs: "RUN_MODE is required: use one of webhook, imap, both",
+		},
+		{
+			name:        "row 9b: programmatic invalid RUN_MODE -> fail-fast",
+			cfg:         &config.Config{RunMode: "invalid", Auth: validCreds, IMAP: validIMAP},
+			wantErrSubs: "RUN_MODE is required: use one of webhook, imap, both",
+		},
+		{
+			name:        "row 9c: nil *config.Config -> fail-fast without panic",
+			cfg:         nil,
+			wantErrSubs: "RUN_MODE is required: use one of webhook, imap, both",
+		},
 	}
-	lookup := func(k string) string { return env[k] }
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- run(ctx, nil, &buf, lookup, readyCh)
-	}()
-
-	select {
-	case addr := <-readyCh:
-		if addr == "" {
-			t.Fatal("expected non-empty bound address")
-		}
-	case err := <-errCh:
-		t.Fatalf("run failed before ready: %v", err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for server ready")
-	}
-
-	cancel()
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("expected nil error on shutdown, got: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for run to exit")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveRunModes(tc.cfg)
+			if tc.wantErrSubs != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil (modes=%+v)", tc.wantErrSubs, got)
+				}
+				if !strings.Contains(err.Error(), tc.wantErrSubs) {
+					t.Errorf("expected error containing %q, got %q", tc.wantErrSubs, err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.wantModes {
+				t.Errorf("got %+v, want %+v", got, tc.wantModes)
+			}
+		})
 	}
 }
 
@@ -1067,7 +1150,8 @@ func TestRun_E2E_MultiCredentialAuth(t *testing.T) {
 	readyCh := make(chan string, 1)
 
 	env := map[string]string{
-		"PORT": "0",
+		"PORT":     "0",
+		"RUN_MODE": "webhook",
 		"AUTH_CREDENTIALS": `[{"name":"device-1","token":"tok-1"},` +
 			`{"name":"tablet","username":"tab-user","password":"tab-pass"},` +
 			`{"name":"device-2","token":"tok-2","username":"dual-user","password":"dual-pass"}]`,
@@ -1187,6 +1271,7 @@ func TestRun_FailsFastOnDuplicateAuthenticationFactor(t *testing.T) {
 
 	env := map[string]string{
 		"PORT":             "0",
+		"RUN_MODE":         "webhook",
 		"AUTH_CREDENTIALS": `[{"name":"a","token":"same"},{"name":"b","token":"same"}]`,
 	}
 	err := run(ctx, nil, io.Discard, func(k string) string { return env[k] })
@@ -1200,7 +1285,7 @@ func TestRun_FailsFastOnDuplicateAuthenticationFactor(t *testing.T) {
 
 // TestRun_FailsFastWhenWebhookWouldBeServedWithoutCredentials pins the removal of the implicit
 // open-access mode: if the process is going to serve the HTTP webhook, it must have credentials.
-// The escape hatch is IMAP-only mode (RUN_TRIGGER=true), which serves no HTTP at all.
+// The escape hatch is IMAP-only mode (RUN_MODE=imap), which serves no HTTP at all.
 func TestRun_FailsFastWhenWebhookWouldBeServedWithoutCredentials(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1208,19 +1293,19 @@ func TestRun_FailsFastWhenWebhookWouldBeServedWithoutCredentials(t *testing.T) {
 	}{
 		{
 			name: "no authentication configured at all",
-			env:  map[string]string{"PORT": "0"},
+			env:  map[string]string{"PORT": "0", "RUN_MODE": "webhook"},
 		},
 		{
 			name: "legacy variables are no longer honoured, so this is still unauthenticated",
-			env:  map[string]string{"PORT": "0", "AUTH_TOKEN": "orphan-token"},
+			env:  map[string]string{"PORT": "0", "RUN_MODE": "webhook", "AUTH_TOKEN": "orphan-token"},
 		},
 		{
 			name: "half-configured legacy basic is no longer honoured either",
-			env:  map[string]string{"PORT": "0", "AUTH_USERNAME": "admin"},
+			env:  map[string]string{"PORT": "0", "RUN_MODE": "webhook", "AUTH_USERNAME": "admin"},
 		},
 		{
 			name: "blank AUTH_CREDENTIALS counts as unconfigured",
-			env:  map[string]string{"PORT": "0", "AUTH_CREDENTIALS": "   "},
+			env:  map[string]string{"PORT": "0", "RUN_MODE": "webhook", "AUTH_CREDENTIALS": "   "},
 		},
 	}
 
@@ -1240,5 +1325,199 @@ func TestRun_FailsFastWhenWebhookWouldBeServedWithoutCredentials(t *testing.T) {
 				t.Errorf("expected the error to name AUTH_CREDENTIALS, got: %v", err)
 			}
 		})
+	}
+}
+
+func TestRun_RunModeIMAPStartsWithoutAuth(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Occupy a port and pass it as PORT: if RUN_MODE=imap ever started the HTTP server, the bind
+	// would fail and run() would return that error instead of nil. This makes the "no HTTP"
+	// guarantee observable instead of relying only on the absence of a log line.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = occupied.Close() }()
+	_, portStr, _ := net.SplitHostPort(occupied.Addr().String())
+
+	var buf bytes.Buffer
+	env := map[string]string{
+		"RUN_MODE":                  "imap",
+		"PORT":                      portStr,
+		"EMAIL_TRIGGER_LOGIN_EMAIL": "test@example.com",
+		"EMAIL_TRIGGER_PASSWORD":    "secret",
+		"EMAIL_TRIGGER_IMAP_SERVER": "127.0.0.1",
+		"EMAIL_TRIGGER_IMAP_PORT":   "0",
+	}
+	if err := run(ctx, nil, &buf, func(k string) string { return env[k] }); err != nil {
+		t.Fatalf("expected nil for RUN_MODE=imap without AUTH_CREDENTIALS, got: %v", err)
+	}
+	logs := buf.String()
+	if strings.Contains(logs, "starting HTTP webhook server") {
+		t.Errorf("RUN_MODE=imap must not start the HTTP server, got logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, "starting IMAP email trigger listener") {
+		t.Errorf("RUN_MODE=imap must start the IMAP listener, got logs:\n%s", logs)
+	}
+}
+
+func TestRun_RunModeRequired(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := run(ctx, nil, io.Discard, func(string) string { return "" })
+	if err == nil {
+		t.Fatal("expected error when RUN_MODE is unset, got nil")
+	}
+	if !strings.Contains(err.Error(), "RUN_MODE") {
+		t.Fatalf("expected error to mention RUN_MODE, got: %v", err)
+	}
+
+	t.Setenv("RUN_MODE", "")
+	if errNilLookup := run(ctx, nil, io.Discard, nil); errNilLookup == nil || !strings.Contains(errNilLookup.Error(), "RUN_MODE") {
+		t.Fatalf("expected error mentioning RUN_MODE with nil lookup, got: %v", errNilLookup)
+	}
+}
+
+func TestRun_RunModeIMAPRejectsCredentials(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	env := map[string]string{
+		"PORT":                      "0",
+		"RUN_MODE":                  "imap",
+		"EMAIL_TRIGGER_LOGIN_EMAIL": "test@example.com",
+		"EMAIL_TRIGGER_PASSWORD":    "secret",
+		"AUTH_CREDENTIALS":          credentialEnv("dev", "tok"),
+	}
+	err := run(ctx, nil, io.Discard, func(k string) string { return env[k] })
+	if err == nil {
+		t.Fatal("expected error when AUTH_CREDENTIALS is provided under RUN_MODE=imap, got nil")
+	}
+	if !strings.Contains(err.Error(), "RUN_MODE=imap") {
+		t.Fatalf("expected error to mention RUN_MODE=imap, got: %v", err)
+	}
+}
+
+func TestRun_RunModeWebhookIgnoresIMAP(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var buf bytes.Buffer
+	env := map[string]string{
+		"PORT":                      "0",
+		"RUN_MODE":                  "webhook",
+		"AUTH_CREDENTIALS":          credentialEnv("dev", "tok"),
+		"EMAIL_TRIGGER_LOGIN_EMAIL": "test@example.com",
+		"EMAIL_TRIGGER_PASSWORD":    "secret",
+	}
+	if err := run(ctx, nil, &buf, func(k string) string { return env[k] }); err != nil {
+		t.Fatalf("expected nil exit, got: %v", err)
+	}
+	const wantWarn = "IMAP configuration is present but ignored: RUN_MODE=webhook does not start the IMAP listener; use RUN_MODE=both"
+	if count := strings.Count(buf.String(), wantWarn); count != 1 {
+		t.Fatalf("expected warning %q exactly once, got %d times in logs:\n%s", wantWarn, count, buf.String())
+	}
+	if strings.Contains(buf.String(), "starting IMAP email trigger listener") {
+		t.Errorf("RUN_MODE=webhook must not start the IMAP listener, got logs:\n%s", buf.String())
+	}
+}
+
+// TestRun_RunModeGatePrecedesResourceConstruction pins the startup order: the RUN_MODE gate must
+// be evaluated before the pipeline and the delivery targets are built, so a misconfigured process
+// fails without side effects that suggest a channel was already brought up.
+func TestRun_RunModeGatePrecedesResourceConstruction(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var buf bytes.Buffer
+	env := map[string]string{
+		"AUTH_CREDENTIALS":   credentialEnv("dev", "tok"),
+		"TELEGRAM_BOT_TOKEN": "tg-token",
+		"TELEGRAM_CHAT_ID":   "42",
+		// RUN_MODE intentionally unset: the gate must stop the startup here.
+	}
+	err := run(ctx, nil, &buf, func(k string) string { return env[k] })
+	if err == nil || !strings.Contains(err.Error(), "RUN_MODE") {
+		t.Fatalf("expected the RUN_MODE gate to reject the startup, got: %v", err)
+	}
+	if strings.Contains(buf.String(), "registered deliver target") {
+		t.Errorf("RUN_MODE gate must run before delivery targets are built, got logs:\n%s", buf.String())
+	}
+
+	// Log-independent proof of the same ordering: the pipeline would fail to compile the regex,
+	// but the RUN_MODE gate must win because it is evaluated first.
+	badPipelineEnv := map[string]string{
+		"AUTH_CREDENTIALS":   credentialEnv("dev", "tok"),
+		"REGEX_FILTER_BLACK": `["[unclosed-bracket"]`,
+	}
+	err = run(ctx, nil, io.Discard, func(k string) string { return badPipelineEnv[k] })
+	if err == nil || !strings.Contains(err.Error(), "RUN_MODE") {
+		t.Fatalf("RUN_MODE gate must run before the pipeline is built, got: %v", err)
+	}
+}
+
+// TestRun_E2E_BasicBytesPreservedThroughConfig exercises the C-7 contract across the full startup
+// path: parseCredentials stores Basic fields verbatim, main hands them to the webhook handler
+// unchanged, and the request side compares them byte-for-byte. A unit test on either side alone
+// would not catch a future trim re-introduced in the wiring.
+func TestRun_E2E_BasicBytesPreservedThroughConfig(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var buf bytes.Buffer
+	readyCh := make(chan string, 1)
+
+	env := map[string]string{
+		"PORT":             "0",
+		"RUN_MODE":         "webhook",
+		"AUTH_CREDENTIALS": `[{"name":"padded","username":"  user  ","password":"  pass  "}]`,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(ctx, nil, &buf, func(k string) string { return env[k] }, readyCh)
+	}()
+
+	var addr string
+	select {
+	case addr = <-readyCh:
+	case err := <-errCh:
+		t.Fatalf("run exited before ready: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for server ready")
+	}
+
+	post := func(user, pass string) int {
+		req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/webhook", bytes.NewBufferString(`{"msg_type":"text"}`))
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		req.SetBasicAuth(user, pass)
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatalf("POST /webhook failed: %v", err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := post("  user  ", "  pass  "); code != http.StatusOK {
+		t.Errorf("exact byte-for-byte Basic pair must authenticate, got %d", code)
+	}
+	if code := post("user", "pass"); code != http.StatusUnauthorized {
+		t.Errorf("trimmed Basic pair must not match the configured bytes, got %d", code)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected nil on shutdown, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for run to exit")
 	}
 }

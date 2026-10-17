@@ -50,6 +50,42 @@ func isCleanExit(err error) bool {
 	return errors.Is(err, flag.ErrHelp)
 }
 
+type runModes struct {
+	Webhook bool
+	IMAP    bool
+}
+
+// resolveRunModes is the single definition of what each RUN_MODE requires. It runs before any
+// resource is constructed, so an unusable mode declaration always fails the startup gate first.
+func resolveRunModes(cfg *config.Config) (runModes, error) {
+	if cfg == nil {
+		return runModes{}, errors.New("environment variable RUN_MODE is required: use one of webhook, imap, both")
+	}
+	switch cfg.RunMode {
+	case config.RunModeWebhook:
+		if !cfg.Auth.HasWebhookAuth() {
+			return runModes{}, errors.New("environment variable RUN_MODE=webhook requires AUTH_CREDENTIALS with at least one usable credential")
+		}
+	case config.RunModeIMAP:
+		if !cfg.IMAP.Enabled() {
+			return runModes{}, errors.New("environment variable RUN_MODE=imap requires EMAIL_TRIGGER_LOGIN_EMAIL and EMAIL_TRIGGER_PASSWORD")
+		}
+		if cfg.Auth.HasWebhookAuth() {
+			return runModes{}, errors.New("environment variable AUTH_CREDENTIALS is not used with RUN_MODE=imap; remove it or set RUN_MODE=both")
+		}
+	case config.RunModeBoth:
+		if !cfg.Auth.HasWebhookAuth() {
+			return runModes{}, errors.New("environment variable RUN_MODE=both requires AUTH_CREDENTIALS with at least one usable credential")
+		}
+		if !cfg.IMAP.Enabled() {
+			return runModes{}, errors.New("environment variable RUN_MODE=both requires EMAIL_TRIGGER_LOGIN_EMAIL and EMAIL_TRIGGER_PASSWORD")
+		}
+	default:
+		return runModes{}, errors.New("environment variable RUN_MODE is required: use one of webhook, imap, both")
+	}
+	return runModes{Webhook: cfg.RunMode.StartsWebhook(), IMAP: cfg.RunMode.StartsIMAP()}, nil
+}
+
 // run executes the push-transfer service with the provided context, CLI arguments,
 // output writer, optional config lookup function, and optional ready channel.
 func run(ctx context.Context, args []string, stdout io.Writer, lookup func(string) string, ready ...chan<- string) error {
@@ -88,42 +124,29 @@ func run(ctx context.Context, args []string, stdout io.Writer, lookup func(strin
 		return fmt.Errorf("failed to load configuration: %w", err)
 	}
 
-	if cfg.IMAP != nil && cfg.IMAP.HasPartialConfig() {
-		logger.Warn("partial IMAP trigger configuration detected; IMAP listener will not start unless all required fields are set")
+	// 3. Evaluate run modes before constructing anything. This is the startup contract (see
+	// AGENTS.md contract 3): a missing RUN_MODE, or a mode whose prerequisites are not met, must
+	// fail fail-fast before the pipeline, HTTP clients and delivery targets are built, so the
+	// operator never sees "registered deliver target" for a process that is about to exit.
+	modes, err := resolveRunModes(cfg)
+	if err != nil {
+		return err
 	}
 
-	// 3. Build processing pipeline
+	if !modes.IMAP && (cfg.IMAP.Enabled() || cfg.IMAP.HasPartialConfig()) {
+		logger.Warn("IMAP configuration is present but ignored: RUN_MODE=webhook does not start the IMAP listener; use RUN_MODE=both")
+	}
+
+	logger.Info("resolved run mode", "run_mode", string(cfg.RunMode), "webhook", modes.Webhook, "imap", modes.IMAP)
+
+	// 4. Build processing pipeline
 	pipe, err := pipeline.NewPipelineFromRules(cfg.Rules, 500*time.Millisecond, logger)
 	if err != nil {
 		return fmt.Errorf("failed to initialize processing pipeline: %w", err)
 	}
 
-	// 4. Build delivery dispatcher and register all enabled targets
+	// 5. Build delivery dispatcher and register all enabled targets
 	dispatcher := buildDispatcher(cfg, logger)
-
-	// 5. Evaluate run modes.
-	//
-	// The webhook is never served without credentials: an unauthenticated entry point is a
-	// misconfiguration, not a supported mode. The only way to run without AUTH_CREDENTIALS is
-	// IMAP-only mode (RUN_TRIGGER=true), which serves no HTTP at all.
-	startWebhook := cfg.Auth.HasWebhookAuth()
-	startIMAP := cfg.RunTrigger && cfg.IMAP.Enabled()
-
-	if !startWebhook && !cfg.RunTrigger {
-		return errors.New("no webhook credentials configured: set AUTH_CREDENTIALS, or set RUN_TRIGGER=true to run in IMAP-only mode without an HTTP endpoint")
-	}
-
-	if cfg.RunTrigger && !startIMAP {
-		logger.Warn("RUN_TRIGGER is enabled but IMAP is not configured; email trigger listener will not start")
-	}
-
-	if !startWebhook && !startIMAP {
-		return errors.New("no services configured to run (webhook disabled and IMAP trigger unconfigured)")
-	}
-
-	if !startWebhook {
-		logger.Info("HTTP webhook endpoint is disabled because RUN_TRIGGER is enabled without webhook credentials; running in IMAP-only mode")
-	}
 
 	// 6. Setup root context and cancellation
 	rootCtx, rootCancel := context.WithCancel(ctx)
@@ -132,7 +155,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, lookup func(strin
 	var wg sync.WaitGroup
 
 	// 7. Start IMAP listener if enabled
-	if startIMAP {
+	if modes.IMAP {
 		imapHandler := func(ctx context.Context, msg *model.Message) error {
 			pass, err := pipe.Process(msg)
 			if err != nil {
@@ -174,7 +197,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, lookup func(strin
 
 	// 8. Start HTTP Webhook server if enabled
 	var httpServer *http.Server
-	if startWebhook {
+	if modes.Webhook {
 		creds := cfg.Auth.Credentials
 		credNames := make([]string, len(creds))
 		for i, c := range creds {
