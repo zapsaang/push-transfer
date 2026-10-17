@@ -153,6 +153,7 @@ type RulesConfig struct {
 // RunMode declares which ingress services push-transfer starts.
 type RunMode string
 
+// The three accepted RUN_MODE values and the ingress services each one starts.
 const (
 	RunModeWebhook RunMode = "webhook"
 	RunModeIMAP    RunMode = "imap"
