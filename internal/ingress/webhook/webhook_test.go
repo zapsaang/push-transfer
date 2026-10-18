@@ -1344,3 +1344,63 @@ func TestWebhook_ProtocolExtension_EndToEnd(t *testing.T) {
 		t.Errorf("expected complex text to contain '当前电量: 85%%', got:\n%s", complexText)
 	}
 }
+
+func TestWebhook_TimeSensitive_FlexibleVariants(t *testing.T) {
+	testCases := []struct {
+		name          string
+		timeSensitive string
+		expected      bool
+	}{
+		{"string true", `"true"`, true},
+		{"string false", `"false"`, false},
+		{"integer 1", `1`, true},
+		{"integer 0", `0`, false},
+		{"string 1", `"1"`, true},
+		{"string 0", `"0"`, false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pipe, err := pipeline.NewPipelineFromRules(config.RulesConfig{}, 500*time.Millisecond)
+			if err != nil {
+				t.Fatalf("failed to create pipeline: %v", err)
+			}
+			capture := &captureDeliverer{}
+			token := "sec-token-12345678"
+
+			h := webhook.NewHandler(webhook.HandlerOptions{
+				Credentials: []config.Credential{{Token: token}},
+				Processor:   pipe,
+				Deliverer:   capture,
+			})
+
+			payload := fmt.Sprintf(`{
+				"msg_type": "text",
+				"title": "测试",
+				"content": "无验证码的普通消息",
+				"time_sensitive": %s
+			}`, tc.timeSensitive)
+
+			req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(payload))
+			req.Header.Set("Authorization", "Bearer "+token)
+			rec := httptest.NewRecorder()
+
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+			}
+
+			capture.mu.Lock()
+			delivered := capture.msg
+			capture.mu.Unlock()
+
+			if delivered == nil {
+				t.Fatal("expected delivered message, got nil")
+			}
+			if delivered.TimeSensitive != tc.expected {
+				t.Errorf("expected TimeSensitive %v for %s, got %v", tc.expected, tc.timeSensitive, delivered.TimeSensitive)
+			}
+		})
+	}
+}

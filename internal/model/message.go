@@ -227,15 +227,61 @@ func parseBatteryLevel(raw []byte) *int {
 	return nil
 }
 
-// UnmarshalJSON unmarshals JSON into Message with flexible battery_level parsing.
+func parseTimeSensitive(raw []byte) bool {
+	str := strings.TrimSpace(string(raw))
+	if str == "" || str == "null" {
+		return false
+	}
+
+	// Unquote if passed as JSON string
+	if len(str) >= 2 && str[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return false
+		}
+		str = strings.TrimSpace(s)
+		if str == "" || str == "null" {
+			return false
+		}
+	}
+
+	// 1. Fast-path: standard boolean parsing (supports "true", "false", "True", "False", "1", "0", "t", "f", "T", "F")
+	if val, err := strconv.ParseBool(str); err == nil {
+		return val
+	}
+
+	// 2. Fallback: float representation (e.g., 1.0, 1e0 or "1.0" -> true, 0.0, 0e0 or "0.0" -> false)
+	if f, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+		if f == 1.0 {
+			return true
+		}
+		if f == 0.0 {
+			return false
+		}
+	}
+
+	return false
+}
+
+// UnmarshalJSON unmarshals JSON into Message with flexible battery_level and time_sensitive parsing,
+// while preserving existing fields on the struct when omitted in the incoming JSON.
 func (m *Message) UnmarshalJSON(b []byte) error {
 	if m == nil {
 		return errors.New("model.Message: UnmarshalJSON on nil pointer")
 	}
 	type Alias Message
-	var raw struct {
+	clonedAlias := Alias(*m)
+	if m.BatteryLevel != nil {
+		batt := *m.BatteryLevel
+		clonedAlias.BatteryLevel = &batt
+	}
+
+	raw := struct {
 		Alias
-		BatteryLevel json.RawMessage `json:"battery_level,omitempty"`
+		BatteryLevel  json.RawMessage `json:"battery_level,omitempty"`
+		TimeSensitive json.RawMessage `json:"time_sensitive,omitempty"`
+	}{
+		Alias: clonedAlias,
 	}
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return err
@@ -244,6 +290,9 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 
 	if len(raw.BatteryLevel) > 0 {
 		m.BatteryLevel = parseBatteryLevel(raw.BatteryLevel)
+	}
+	if len(raw.TimeSensitive) > 0 {
+		m.TimeSensitive = parseTimeSensitive(raw.TimeSensitive)
 	}
 	return nil
 }

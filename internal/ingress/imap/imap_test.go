@@ -1926,3 +1926,189 @@ func TestIMAP_ProtocolExtension_EndToEnd(t *testing.T) {
 		t.Errorf("expected complex text to contain '当前电量: 85%%', got:\n%s", complexText)
 	}
 }
+
+func TestParseEmail_TimeSensitiveVariants(t *testing.T) {
+	testCases := []struct {
+		name          string
+		timeSensitive string
+		expected      bool
+	}{
+		{"string true", `"true"`, true},
+		{"string false", `"false"`, false},
+		{"integer 1", `1`, true},
+		{"integer 0", `0`, false},
+		{"string 1", `"1"`, true},
+		{"string 0", `"0"`, false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			rawEmail := fmt.Sprintf("Subject: PushTransfer Email Trigger\r\n"+
+				"Content-Type: text/plain; charset=utf-8\r\n\r\n"+
+				`{"msg_type":"text","title":"test","content":"body","time_sensitive":%s}`, tc.timeSensitive)
+
+			msg, ok, err := imap.ParseEmail(strings.NewReader(rawEmail))
+			if err != nil {
+				t.Fatalf("failed to parse email: %v", err)
+			}
+			if !ok {
+				t.Fatal("expected email to be processed, but was ignored")
+			}
+			if msg == nil {
+				t.Fatal("expected non-nil message")
+			}
+			if msg.TimeSensitive != tc.expected {
+				t.Errorf("expected TimeSensitive %v for %s, got %v", tc.expected, tc.timeSensitive, msg.TimeSensitive)
+			}
+		})
+	}
+}
+
+func TestListener_TimeSensitive_EndToEndIntegration(t *testing.T) {
+	testCases := []struct {
+		name          string
+		timeSensitive string
+		expected      bool
+	}{
+		{"string true", `"true"`, true},
+		{"string false", `"false"`, false},
+		{"integer 1", `1`, true},
+		{"integer 0", `0`, false},
+		{"string 1", `"1"`, true},
+		{"string 0", `"0"`, false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			clientConn, serverConn := net.Pipe()
+			defer func() { _ = clientConn.Close() }()
+			defer func() { _ = serverConn.Close() }()
+
+			var (
+				mu          sync.Mutex
+				emailSeen   bool
+				delivered   *model.Message
+				deliveredCh = make(chan struct{})
+			)
+
+			rawEmail := fmt.Sprintf("Subject: PushTransfer Email Trigger\r\n"+
+				"MIME-Version: 1.0\r\n"+
+				"Content-Type: text/plain; charset=utf-8\r\n\r\n"+
+				`{"msg_type":"text","title":"E2E Test","content":"Verification Body","time_sensitive":%s}`, tc.timeSensitive)
+
+			go func() {
+				r := bufio.NewReader(serverConn)
+				w := bufio.NewWriter(serverConn)
+				writeLine := func(s string) {
+					_, _ = w.WriteString(s)
+					_ = w.Flush()
+				}
+
+				writeLine("* OK [CAPABILITY IMAP4rev1 IDLE] Mock IMAP Server Ready\r\n")
+
+				for {
+					line, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					line = strings.TrimRight(line, "\r\n")
+					parts := strings.SplitN(line, " ", 2)
+					if len(parts) < 2 {
+						continue
+					}
+					tag := parts[0]
+					cmd := parts[1]
+					upperCmd := strings.ToUpper(cmd)
+
+					switch {
+					case strings.HasPrefix(upperCmd, "CAPABILITY"):
+						writeLine("* CAPABILITY IMAP4rev1 IDLE\r\n" + tag + " OK CAPABILITY completed\r\n")
+					case strings.HasPrefix(upperCmd, "LOGIN"):
+						writeLine(tag + " OK LOGIN completed\r\n")
+					case strings.HasPrefix(upperCmd, "SELECT"):
+						writeLine("* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] UIDs valid\r\n* FLAGS (\\Seen)\r\n* OK [PERMANENTFLAGS (\\Seen)] Flags permitted\r\n" + tag + " OK [READ-WRITE] SELECT completed\r\n")
+					case strings.HasPrefix(upperCmd, "UID SEARCH"):
+						mu.Lock()
+						seen := emailSeen
+						mu.Unlock()
+						if !seen {
+							writeLine("* SEARCH 5001\r\n" + tag + " OK UID SEARCH completed\r\n")
+						} else {
+							writeLine("* SEARCH\r\n" + tag + " OK UID SEARCH completed\r\n")
+						}
+					case strings.HasPrefix(upperCmd, "UID FETCH"):
+						fetchResp := fmt.Sprintf("* 1 FETCH (UID 5001 BODY[] {%d}\r\n%s)\r\n%s OK UID FETCH completed\r\n",
+							len(rawEmail), rawEmail, tag)
+						writeLine(fetchResp)
+					case strings.HasPrefix(upperCmd, "UID STORE"):
+						mu.Lock()
+						emailSeen = true
+						mu.Unlock()
+						writeLine(tag + " OK UID STORE completed\r\n")
+					case strings.HasPrefix(upperCmd, "IDLE"):
+						writeLine("+ idling\r\n")
+						for {
+							l, errD := r.ReadString('\n')
+							if errD != nil {
+								return
+							}
+							if strings.TrimRight(l, "\r\n") == "DONE" {
+								writeLine(tag + " OK IDLE completed\r\n")
+								break
+							}
+						}
+					case strings.HasPrefix(upperCmd, "LOGOUT"):
+						writeLine("* BYE Logging out\r\n" + tag + " OK LOGOUT completed\r\n")
+						return
+					}
+				}
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			listener := imap.NewListener(imap.ListenerOptions{
+				IMAPServer: "127.0.0.1",
+				IMAPPort:   9993,
+				LoginEmail: "test@example.com",
+				Password:   "secret",
+				DialConn: func(_ context.Context, _ string) (net.Conn, error) {
+					return clientConn, nil
+				},
+				Handler: func(_ context.Context, msg *model.Message) error {
+					mu.Lock()
+					delivered = msg.Clone()
+					mu.Unlock()
+					close(deliveredCh)
+					return nil
+				},
+			})
+
+			go func() {
+				select {
+				case <-deliveredCh:
+					cancel()
+				case <-time.After(1500 * time.Millisecond):
+					cancel()
+				}
+			}()
+
+			_ = listener.Start(ctx)
+
+			mu.Lock()
+			d := delivered
+			seen := emailSeen
+			mu.Unlock()
+
+			if d == nil {
+				t.Fatalf("expected message to be delivered to handler, got nil")
+			}
+			if d.TimeSensitive != tc.expected {
+				t.Errorf("expected TimeSensitive %v for %s, got %v", tc.expected, tc.timeSensitive, d.TimeSensitive)
+			}
+			if !seen {
+				t.Errorf("expected email UID 5001 to be marked as \\Seen after successful delivery")
+			}
+		})
+	}
+}

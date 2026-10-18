@@ -355,6 +355,260 @@ func TestMessage_BatteryLevel_FlexibleUnmarshal(t *testing.T) {
 	}
 }
 
+func TestMessage_TimeSensitive_FlexibleUnmarshal(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		{"omitted", `{"msg_type":"text","title":"test","content":"hi"}`, false},
+		{"explicit null", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":null}`, false},
+		{"boolean true", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":true}`, true},
+		{"boolean false", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":false}`, false},
+		{"string true", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"true"}`, true},
+		{"string false", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"false"}`, false},
+		{"string True mixed case", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"True"}`, true},
+		{"string FALSE mixed case", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"FALSE"}`, false},
+		{"string with spaces true", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":" true "}`, true},
+		{"string with spaces false", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":" false "}`, false},
+		{"integer 1", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":1}`, true},
+		{"integer 0", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":0}`, false},
+		{"string 1", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"1"}`, true},
+		{"string 0", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"0"}`, false},
+		{"string with spaces 1", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":" 1 "}`, true},
+		{"string with spaces 0", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":" 0 "}`, false},
+		{"float 1.0", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":1.0}`, true},
+		{"float 0.0", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":0.0}`, false},
+		{"float string 1.0", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"1.0"}`, true},
+		{"float string 0.0", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"0.0"}`, false},
+		{"empty string", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":""}`, false},
+		{"whitespace string", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"   "}`, false},
+		{"string null", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"null"}`, false},
+		{"invalid string", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"invalid"}`, false},
+		{"other integer 2", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":2}`, false},
+		{"negative integer -1", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":-1}`, false},
+		{"other string 2", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"2"}`, false},
+		{"scientific notation 1e0", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":1e0}`, true},
+		{"scientific notation 0e0", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":0e0}`, false},
+		{"scientific string 1e0", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"1e0"}`, true},
+		{"scientific string 0e0", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"0e0"}`, false},
+		{"json array fallback", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":[1,2]}`, false},
+		{"json object fallback", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":{"a":1}}`, false},
+		{"string null with spaces", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":" null "}`, false},
+		{"raw token with spaces 1", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":  1  }`, true},
+		{"raw token with spaces 0", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":  0  }`, false},
+		{"raw token with spaces true", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":  true  }`, true},
+		{"raw token with spaces false", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":  false  }`, false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var msg Message
+			err := json.Unmarshal([]byte(tc.input), &msg)
+			if err != nil {
+				t.Fatalf("unexpected unmarshal error: %v", err)
+			}
+			if msg.TimeSensitive != tc.expected {
+				t.Fatalf("expected TimeSensitive %v for input %s, got %v", tc.expected, tc.input, msg.TimeSensitive)
+			}
+		})
+	}
+}
+
+func TestMessage_TimeSensitive_MarshalRoundTrip(t *testing.T) {
+	// 1. True round-trip
+	msg1 := &Message{
+		MsgType:       MsgTypeText,
+		Title:         "Notification",
+		Content:       "Hello",
+		TimeSensitive: true,
+	}
+	data1, err := json.Marshal(msg1)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+	if !strings.Contains(string(data1), `"time_sensitive":true`) {
+		t.Errorf("expected marshaled json to contain '\"time_sensitive\":true', got: %s", string(data1))
+	}
+	var round1 Message
+	if err := json.Unmarshal(data1, &round1); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if !round1.TimeSensitive {
+		t.Errorf("expected round1.TimeSensitive to be true, got false")
+	}
+
+	// 2. False round-trip (omitempty should omit the field)
+	msg2 := &Message{
+		MsgType:       MsgTypeText,
+		Title:         "Notification",
+		Content:       "Hello",
+		TimeSensitive: false,
+	}
+	data2, err := json.Marshal(msg2)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+	if strings.Contains(string(data2), "time_sensitive") {
+		t.Errorf("expected marshaled json to omit 'time_sensitive' when false, got: %s", string(data2))
+	}
+	var round2 Message
+	if err := json.Unmarshal(data2, &round2); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if round2.TimeSensitive {
+		t.Errorf("expected round2.TimeSensitive to be false, got true")
+	}
+}
+
+func TestMessage_UnmarshalJSON_AllFieldsPreservedWhenOmitted(t *testing.T) {
+	intPtr := func(v int) *int { return &v }
+	original := &Message{
+		MsgType:       MsgTypeAppNotification,
+		AppName:       "OldApp",
+		Title:         "OldTitle",
+		Content:       "OldContent",
+		Hostname:      "OldHost",
+		BatteryLevel:  intPtr(77),
+		Timestamp:     1700000001,
+		SendTime:      1700000002,
+		ReceiveTime:   1700000003,
+		TransmitTime:  1700000004,
+		IncomingTime:  1700000005,
+		TimeSensitive: true,
+		Emergency:     true,
+		CaptchaCode:   "888999",
+	}
+
+	// Only update content
+	err := json.Unmarshal([]byte(`{"content":"UpdatedContentOnly"}`), original)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// 1. Updated field
+	if original.Content != "UpdatedContentOnly" {
+		t.Errorf("expected Content to be updated to 'UpdatedContentOnly', got %q", original.Content)
+	}
+
+	// 2. All other 13 fields MUST be strictly preserved
+	if original.MsgType != MsgTypeAppNotification {
+		t.Errorf("expected MsgType preserved as 'app_notification', got %q", original.MsgType)
+	}
+	if original.AppName != "OldApp" {
+		t.Errorf("expected AppName preserved as 'OldApp', got %q", original.AppName)
+	}
+	if original.Title != "OldTitle" {
+		t.Errorf("expected Title preserved as 'OldTitle', got %q", original.Title)
+	}
+	if original.Hostname != "OldHost" {
+		t.Errorf("expected Hostname preserved as 'OldHost', got %q", original.Hostname)
+	}
+	if original.BatteryLevel == nil || *original.BatteryLevel != 77 {
+		t.Errorf("expected BatteryLevel preserved as 77, got %v", original.BatteryLevel)
+	}
+	if original.Timestamp != 1700000001 {
+		t.Errorf("expected Timestamp preserved as 1700000001, got %d", original.Timestamp)
+	}
+	if original.SendTime != 1700000002 {
+		t.Errorf("expected SendTime preserved as 1700000002, got %d", original.SendTime)
+	}
+	if original.ReceiveTime != 1700000003 {
+		t.Errorf("expected ReceiveTime preserved as 1700000003, got %d", original.ReceiveTime)
+	}
+	if original.TransmitTime != 1700000004 {
+		t.Errorf("expected TransmitTime preserved as 1700000004, got %d", original.TransmitTime)
+	}
+	if original.IncomingTime != 1700000005 {
+		t.Errorf("expected IncomingTime preserved as 1700000005, got %d", original.IncomingTime)
+	}
+	if !original.TimeSensitive {
+		t.Errorf("expected TimeSensitive preserved as true, got false")
+	}
+	if !original.Emergency {
+		t.Errorf("expected Emergency preserved as true, got false")
+	}
+	if original.CaptchaCode != "888999" {
+		t.Errorf("expected CaptchaCode preserved as '888999', got %q", original.CaptchaCode)
+	}
+}
+
+func TestMessage_UnmarshalJSON_ExplicitOverwrites(t *testing.T) {
+	intPtr := func(v int) *int { return &v }
+
+	// 1. TimeSensitive overwrite from true to false with all falsy representations
+	falsyVariants := []string{
+		`{"time_sensitive": false}`,
+		`{"time_sensitive": 0}`,
+		`{"time_sensitive": "false"}`,
+		`{"time_sensitive": "0"}`,
+		`{"time_sensitive": null}`,
+	}
+	for _, payload := range falsyVariants {
+		msg := &Message{TimeSensitive: true}
+		if err := json.Unmarshal([]byte(payload), msg); err != nil {
+			t.Fatalf("unexpected unmarshal error for %s: %v", payload, err)
+		}
+		if msg.TimeSensitive {
+			t.Errorf("expected TimeSensitive to be updated to false for payload %s, got true", payload)
+		}
+	}
+
+	// 2. TimeSensitive overwrite from false to true with truthy representations
+	truthyVariants := []string{
+		`{"time_sensitive": true}`,
+		`{"time_sensitive": 1}`,
+		`{"time_sensitive": "true"}`,
+		`{"time_sensitive": "1"}`,
+	}
+	for _, payload := range truthyVariants {
+		msg := &Message{TimeSensitive: false}
+		if err := json.Unmarshal([]byte(payload), msg); err != nil {
+			t.Fatalf("unexpected unmarshal error for %s: %v", payload, err)
+		}
+		if !msg.TimeSensitive {
+			t.Errorf("expected TimeSensitive to be updated to true for payload %s, got false", payload)
+		}
+	}
+
+	// 3. BatteryLevel explicit overwrite to null / 0 / percentage
+	msgBatt := &Message{BatteryLevel: intPtr(50)}
+	if err := json.Unmarshal([]byte(`{"battery_level": null}`), msgBatt); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msgBatt.BatteryLevel != nil {
+		t.Errorf("expected BatteryLevel to be nil after explicit null, got %v", *msgBatt.BatteryLevel)
+	}
+
+	msgBatt2 := &Message{BatteryLevel: intPtr(50)}
+	if err := json.Unmarshal([]byte(`{"battery_level": 0}`), msgBatt2); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msgBatt2.BatteryLevel == nil || *msgBatt2.BatteryLevel != 0 {
+		t.Errorf("expected BatteryLevel to be 0, got %v", msgBatt2.BatteryLevel)
+	}
+
+	msgBatt3 := &Message{BatteryLevel: intPtr(50)}
+	if err := json.Unmarshal([]byte(`{"battery_level": "85%"}`), msgBatt3); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msgBatt3.BatteryLevel == nil || *msgBatt3.BatteryLevel != 85 {
+		t.Errorf("expected BatteryLevel to be 85, got %v", msgBatt3.BatteryLevel)
+	}
+
+	// 4. Pointer deep copy isolation for preserved BatteryLevel
+	sourceLevel := 60
+	msgOriginal := &Message{BatteryLevel: &sourceLevel}
+	if err := json.Unmarshal([]byte(`{"title": "isolated"}`), msgOriginal); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Mutating sourceLevel should not mutate msgOriginal.BatteryLevel if deeply isolated
+	sourceLevel = 99
+	if *msgOriginal.BatteryLevel != 60 {
+		t.Errorf("expected preserved BatteryLevel to be isolated from external pointer mutation, got %d", *msgOriginal.BatteryLevel)
+	}
+}
+
 func TestMessage_TimeSensitiveAndHostname_UnmarshalAndClone(t *testing.T) {
 	// 1. UnmarshalJSON with hostname and time_sensitive
 	payload := `{
@@ -1049,5 +1303,39 @@ func TestSanitizeSingleLine_UnicodeLineTerminators(t *testing.T) {
 	expected := "Pixel-8 Fake: injected More: evil NEL"
 	if got != expected {
 		t.Fatalf("expected %q, got %q", expected, got)
+	}
+}
+
+func TestMessage_UnmarshalJSON_EdgeCases(t *testing.T) {
+	// 1. JSON null has no effect on existing struct
+	msg := &Message{Title: "KeepMe", TimeSensitive: true}
+	err := json.Unmarshal([]byte("null"), msg)
+	if err != nil {
+		t.Fatalf("unexpected error for JSON null: %v", err)
+	}
+	if msg.Title != "KeepMe" || !msg.TimeSensitive {
+		t.Errorf("expected JSON null to have no effect on struct fields, got Title=%q, TimeSensitive=%v", msg.Title, msg.TimeSensitive)
+	}
+
+	// 2. Empty byte slice and whitespace only byte slice should return error
+	var emptyMsg Message
+	if err := json.Unmarshal([]byte(""), &emptyMsg); err == nil {
+		t.Errorf("expected error for empty byte slice, got nil")
+	}
+	if err := json.Unmarshal([]byte("   "), &emptyMsg); err == nil {
+		t.Errorf("expected error for whitespace only byte slice, got nil")
+	}
+
+	// 3. Unknown fields are safely ignored while known fields are parsed
+	unknownMsg := &Message{Title: "InitialTitle"}
+	err = json.Unmarshal([]byte(`{"unknown_custom_field": "some_value", "time_sensitive": 1}`), unknownMsg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if unknownMsg.Title != "InitialTitle" {
+		t.Errorf("expected Title to remain 'InitialTitle', got %q", unknownMsg.Title)
+	}
+	if !unknownMsg.TimeSensitive {
+		t.Errorf("expected TimeSensitive to be updated to true, got false")
 	}
 }
