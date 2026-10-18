@@ -277,6 +277,7 @@ func TestTelegramDeliver(t *testing.T) {
 		MsgType:      model.MsgTypeText,
 		Title:        "<Bank & Co>",
 		Content:      "Alert: balance < $100 & > $50",
+		Hostname:     "Pixel-8",
 		BatteryLevel: &battery,
 	}
 
@@ -306,6 +307,12 @@ func TestTelegramDeliver(t *testing.T) {
 	}
 	if !strings.Contains(text, "&lt;Bank &amp; Co&gt;") {
 		t.Errorf("expected escaped text, got: %s", text)
+	}
+	if !strings.Contains(text, "设备主机名: Pixel-8") {
+		t.Errorf("expected text to contain '设备主机名: Pixel-8', got: %s", text)
+	}
+	if !strings.Contains(text, "当前电量: 85%") {
+		t.Errorf("expected text to contain '当前电量: 85%%', got: %s", text)
 	}
 
 	t.Run("excessively long text is truncated safely", func(t *testing.T) {
@@ -593,10 +600,13 @@ func TestEmailDeliver(t *testing.T) {
 		t.Errorf("expected name 'email', got %s", emailClient.Name())
 	}
 
+	battery := 85
 	msg := &model.Message{
-		MsgType: model.MsgTypeText,
-		Title:   "10086",
-		Content: "Balance alert",
+		MsgType:      model.MsgTypeText,
+		Title:        "10086",
+		Content:      "Balance alert",
+		Hostname:     "Gateway-01",
+		BatteryLevel: &battery,
 	}
 
 	err := emailClient.Send(context.Background(), msg)
@@ -616,6 +626,12 @@ func TestEmailDeliver(t *testing.T) {
 	}
 	if !strings.Contains(emailContent, "Balance alert") {
 		t.Errorf("expected body in email, got: %s", emailContent)
+	}
+	if !strings.Contains(emailContent, "设备主机名: Gateway-01") {
+		t.Errorf("expected email to contain '设备主机名: Gateway-01', got: %s", emailContent)
+	}
+	if !strings.Contains(emailContent, "当前电量: 85%") {
+		t.Errorf("expected email to contain '当前电量: 85%%', got: %s", emailContent)
 	}
 
 	runMockSMTP := func(t *testing.T, msg *model.Message) string {
@@ -1752,5 +1768,220 @@ func TestConsoleDeliver_LogAppName(t *testing.T) {
 	}
 	if !strings.Contains(logOutput, "msg_type=app_notification") {
 		t.Fatalf("expected log to contain 'msg_type=app_notification', got:\n%s", logOutput)
+	}
+}
+
+func TestBarkDeliver_LevelPriorityAndNoHostname(t *testing.T) {
+	aesKey := []byte("1234567890123456")
+
+	t.Run("time-sensitive plaintext without emergency", func(t *testing.T) {
+		var receivedBody map[string]interface{}
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			_ = json.Unmarshal(b, &receivedBody)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer ts.Close()
+
+		bark := deliver.NewBarkDeliver(deliver.BarkOptions{
+			PostURL:    ts.URL,
+			DeviceKeys: []string{"dev_key_1"},
+		})
+
+		msg := &model.Message{
+			MsgType:       model.MsgTypeText,
+			Title:         "Bank",
+			Content:       "Your OTP is 1234",
+			Hostname:      "Pixel-8",
+			TimeSensitive: true,
+			Emergency:     false,
+		}
+
+		err := bark.Send(context.Background(), msg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if receivedBody["level"] != "timeSensitive" {
+			t.Errorf("expected level 'timeSensitive', got %v", receivedBody["level"])
+		}
+		if _, ok := receivedBody["volume"]; ok {
+			t.Errorf("volume should not be set for timeSensitive, got %v", receivedBody["volume"])
+		}
+		if _, ok := receivedBody["hostname"]; ok {
+			t.Errorf("hostname must be explicitly excluded from Bark payload, got %v", receivedBody["hostname"])
+		}
+		if _, ok := receivedBody["subtitle"]; ok {
+			t.Errorf("subtitle must not be set, got %v", receivedBody["subtitle"])
+		}
+	})
+
+	t.Run("time-sensitive encrypted without emergency", func(t *testing.T) {
+		var receivedBody map[string]interface{}
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			_ = json.Unmarshal(b, &receivedBody)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer ts.Close()
+
+		bark := deliver.NewBarkDeliver(deliver.BarkOptions{
+			PostURL:    ts.URL,
+			DeviceKeys: []string{"dev_key_1"},
+			CryptoKey:  aesKey,
+		})
+
+		msg := &model.Message{
+			MsgType:       model.MsgTypeText,
+			Title:         "Bank",
+			Content:       "Your OTP is 1234",
+			Hostname:      "Pixel-8",
+			TimeSensitive: true,
+			Emergency:     false,
+		}
+
+		err := bark.Send(context.Background(), msg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		cipherTextStr := receivedBody["ciphertext"].(string)
+		ivStr := receivedBody["iv"].(string)
+
+		decrypted, err := crypto.DecryptBark(crypto.BarkPayload{Ciphertext: cipherTextStr, IV: ivStr}, aesKey)
+		if err != nil {
+			t.Fatalf("failed to decrypt Bark payload: %v", err)
+		}
+
+		var innerPayload map[string]interface{}
+		if err := json.Unmarshal(decrypted, &innerPayload); err != nil {
+			t.Fatalf("failed to unmarshal decrypted JSON: %v", err)
+		}
+
+		if innerPayload["level"] != "timeSensitive" {
+			t.Errorf("expected decrypted level 'timeSensitive', got %v", innerPayload["level"])
+		}
+		if _, ok := innerPayload["volume"]; ok {
+			t.Errorf("volume should not be set in decrypted payload for timeSensitive")
+		}
+		if _, ok := innerPayload["hostname"]; ok {
+			t.Errorf("hostname must not be set in decrypted Bark payload")
+		}
+	})
+
+	t.Run("emergency priority over time-sensitive", func(t *testing.T) {
+		var receivedBody map[string]interface{}
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			_ = json.Unmarshal(b, &receivedBody)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer ts.Close()
+
+		bark := deliver.NewBarkDeliver(deliver.BarkOptions{
+			PostURL:    ts.URL,
+			DeviceKeys: []string{"dev_key_1"},
+		})
+
+		msg := &model.Message{
+			MsgType:       model.MsgTypeText,
+			Title:         "Fire Alarm",
+			Content:       "Evacuate",
+			TimeSensitive: true,
+			Emergency:     true,
+		}
+
+		err := bark.Send(context.Background(), msg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if receivedBody["level"] != "critical" {
+			t.Errorf("expected critical level when both emergency and time_sensitive are true, got %v", receivedBody["level"])
+		}
+		if receivedBody["volume"] != "5" {
+			t.Errorf("expected volume '5' for critical, got %v", receivedBody["volume"])
+		}
+	})
+
+	t.Run("neither emergency nor time-sensitive omits level", func(t *testing.T) {
+		var receivedBody map[string]interface{}
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			_ = json.Unmarshal(b, &receivedBody)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer ts.Close()
+
+		bark := deliver.NewBarkDeliver(deliver.BarkOptions{
+			PostURL:    ts.URL,
+			DeviceKeys: []string{"dev_key_1"},
+		})
+
+		msg := &model.Message{
+			MsgType:       model.MsgTypeText,
+			Title:         "Normal",
+			Content:       "Hello",
+			TimeSensitive: false,
+			Emergency:     false,
+		}
+
+		err := bark.Send(context.Background(), msg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if _, ok := receivedBody["level"]; ok {
+			t.Errorf("expected no level in default push, got %v", receivedBody["level"])
+		}
+		if _, ok := receivedBody["volume"]; ok {
+			t.Errorf("expected no volume in default push, got %v", receivedBody["volume"])
+		}
+	})
+}
+
+func TestConsoleDeliver_LogHostnameAndTimeSensitive(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	console := deliver.NewConsoleDeliver(logger)
+	msg := &model.Message{
+		MsgType:       model.MsgTypeText,
+		Title:         "10086",
+		Content:       "Notice text",
+		Hostname:      "Node-01",
+		TimeSensitive: true,
+	}
+
+	err := console.Send(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, "hostname=Node-01") {
+		t.Fatalf("expected log to contain 'hostname=Node-01', got:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "time_sensitive=true") {
+		t.Fatalf("expected log to contain 'time_sensitive=true', got:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "设备主机名: Node-01") {
+		t.Fatalf("expected log text to contain '设备主机名: Node-01', got:\n%s", logOutput)
 	}
 }

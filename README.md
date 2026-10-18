@@ -400,8 +400,10 @@ Authorization: Bearer <你的 token>   # AUTH_CREDENTIALS 中某个条目的 tok
   "msg_type": "text",
   "title": "10086",
   "content": "【中国移动】尊敬的客户，您的验证码为 654321，5分钟内有效。",
-  "battery_level": 85,
-  "timestamp": 1729000000,
+  "hostname": "Pixel-8",
+  "battery_level": "85%",
+  "time_sensitive": true,
+  "timestamp": "2026-10-18T00:15:20+08:00",
   "send_time": 1729000000,
   "receive_time": 1729000005
 }
@@ -415,12 +417,14 @@ Authorization: Bearer <你的 token>   # AUTH_CREDENTIALS 中某个条目的 tok
 | `app_name` | string | 否 | 来源应用名称（如 `"微信"`、`"钉钉"`、`"Google Authenticator"`，仅 `app_notification` 使用，用于 Bark 折叠分组与全渠道排版） |
 | `title` | string | 否 | 标题或消息来源（如发件人号码、群聊名称、来电人姓名/号码） |
 | `content` | string | 否 | 通知或短信正文内容（`call` 类型可为空） |
-| `battery_level` | int | 否 | 发送端设备当前剩余电量百分比（如 `85`） |
-| `timestamp` | int/str | 否 | 通用时间戳。系统具备防御性容错，自动兼容毫秒（13位）、秒（10位）、字符串数字或 `null` |
-| `send_time` | int/str | 否 | 消息实际发送时间戳（备选回退字段） |
-| `receive_time` | int/str | 否 | 转发端设备接收时间戳（备选回退字段） |
-| `transmit_time` | int/str | 否 | 转发端设备转发时间戳（备选回退字段） |
-| `incoming_time` | int/str | 否 | 来电或通知到达时间戳（备选回退字段） |
+| `hostname` | string | 否 | 发送端设备主机名/标识（如 `"Pixel-8"`）。在 Telegram、Email 正文末尾及 Console 结构化日志/文本中展示（`设备主机名: ...`）；Bark 显式不携带以保持横幅精简 |
+| `battery_level` | int/str | 否 | 发送端设备当前剩余电量百分比。自适应兼容数值（`85`、`0`）、带百分号或浮点字符串（`"85%"`、`"85.0"`、`" 85 % "`）；空串或非法值安全降级为 `nil`（不误显电量行） |
+| `time_sensitive` | bool | 否 | 时效性通知标记。为 `true` 时 Bark `level` 设置为 `timeSensitive`（iOS 突破专注模式但不破物理静音；若同时为 `emergency` 则紧急优先保持 `critical` 强警报）。若正文命中验证码提取规则，系统自动富化为 `true` |
+| `timestamp` | int/str | 否 | 通用时间戳。系统具备防御性容错，自动兼容秒（10位）、毫秒（13位）、字符串数字、ISO 8601 格式化日期字符串（支持显式时区、无时区本地时间、逗号小数秒与 Unicode 转义）及 RFC 5322 / RFC 2822 邮件格式日期字符串；非法值静默降级为 `0` |
+| `send_time` | int/str | 否 | 消息实际发送时间戳（备选回退字段，享受与 `timestamp` 相同的多格式解析与容错能力） |
+| `receive_time` | int/str | 否 | 转发端设备接收时间戳（备选回退字段，享受与 `timestamp` 相同的多格式解析与容错能力） |
+| `transmit_time` | int/str | 否 | 转发端设备转发时间戳（备选回退字段，享受与 `timestamp` 相同的多格式解析与容错能力） |
+| `incoming_time` | int/str | 否 | 来电或通知到达时间戳（备选回退字段，享受与 `timestamp` 相同的多格式解析与容错能力） |
 
 #### 接口响应状态码
 
@@ -503,8 +507,9 @@ AUTH_CREDENTIALS='[{"name":"phone-a","token":"random-token-1"},{"name":"tablet",
        "msg_type": "text",
        "title": "[from]",
        "content": "[msg]",
+       "hostname": "[model]",
        "timestamp": "[timestamp]",
-       "battery_level": [battery]
+       "battery_level": "[battery]"
      }
      ```
 3. **应用通知转发通道请求体模板**：
@@ -515,8 +520,9 @@ AUTH_CREDENTIALS='[{"name":"phone-a","token":"random-token-1"},{"name":"tablet",
      "app_name": "[app_name]",
      "title": "[title]",
      "content": "[msg]",
+     "hostname": "[model]",
      "timestamp": "[timestamp]",
-     "battery_level": [battery]
+     "battery_level": "[battery]"
    }
    ```
 4. **来电转发通道请求体模板**：
@@ -525,8 +531,9 @@ AUTH_CREDENTIALS='[{"name":"phone-a","token":"random-token-1"},{"name":"tablet",
      "msg_type": "call",
      "title": "[from]",
      "content": "未接来电通知",
+     "hostname": "[model]",
      "timestamp": "[timestamp]",
-     "battery_level": [battery]
+     "battery_level": "[battery]"
    }
    ```
 5. 点击 **测试**，验证能否收到推送。

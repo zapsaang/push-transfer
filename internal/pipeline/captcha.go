@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"strings"
 	"time"
 
 	"github.com/zapsaang/push-transfer/internal/model"
@@ -47,6 +48,9 @@ func (c *CaptchaStrategy) Process(msg *model.Message) (bool, error) {
 				code = match.String()
 			}
 			msg.SetCaptcha(code)
+			if strings.TrimSpace(code) != "" {
+				msg.SetTimeSensitive(true)
+			}
 			return true, nil
 		}
 	}

@@ -235,6 +235,60 @@ func TestCaptchaStrategy(t *testing.T) {
 	}
 }
 
+func TestCaptchaStrategy_SetsTimeSensitive(t *testing.T) {
+	patterns := []string{
+		`验证码[是为：:]*\s*(\d{4,6})`,
+		`empty_pattern:(\s*)`,
+	}
+	captcha, err := NewCaptchaStrategy(patterns, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to create CaptchaStrategy: %v", err)
+	}
+
+	// Scenario A: Matched captcha -> TimeSensitive becomes true
+	msgA := &model.Message{Content: "您的验证码是：123456"}
+	pass, err := captcha.Process(msgA)
+	if err != nil || !pass {
+		t.Fatalf("unexpected process failure: pass=%v, err=%v", pass, err)
+	}
+	if msgA.CaptchaCode != "123456" {
+		t.Errorf("expected CaptchaCode='123456', got %q", msgA.CaptchaCode)
+	}
+	if !msgA.TimeSensitive {
+		t.Errorf("expected TimeSensitive=true when captcha matched, got false")
+	}
+
+	// Scenario B: No match and initially false -> remains false
+	msgB := &model.Message{Content: "Hello world without code", TimeSensitive: false}
+	pass, err = captcha.Process(msgB)
+	if err != nil || !pass {
+		t.Fatalf("unexpected process failure: pass=%v, err=%v", pass, err)
+	}
+	if msgB.TimeSensitive {
+		t.Errorf("expected TimeSensitive=false for unmatched message, got true")
+	}
+
+	// Scenario C: Client preset TimeSensitive=true, no match -> remains true (anti-overwrite)
+	msgC := &model.Message{Content: "Normal notice but urgent", TimeSensitive: true}
+	pass, err = captcha.Process(msgC)
+	if err != nil || !pass {
+		t.Fatalf("unexpected process failure: pass=%v, err=%v", pass, err)
+	}
+	if !msgC.TimeSensitive {
+		t.Errorf("expected TimeSensitive=true to be preserved, got false")
+	}
+
+	// Scenario D: Empty capture group match (only spaces) -> does not set TimeSensitive to true
+	msgD := &model.Message{Content: "empty_pattern:   ", TimeSensitive: false}
+	pass, err = captcha.Process(msgD)
+	if err != nil || !pass {
+		t.Fatalf("unexpected process failure: pass=%v, err=%v", pass, err)
+	}
+	if msgD.TimeSensitive {
+		t.Errorf("expected TimeSensitive=false for whitespace-only capture group, got true")
+	}
+}
+
 // TestEmergencyStrategy verifies that matching patterns set Emergency = true.
 func TestEmergencyStrategy(t *testing.T) {
 	patterns := []string{`(?i)110|120|紧急|fire|alarm`}

@@ -1874,3 +1874,55 @@ func TestListener_HeartbeatDuringIdle(t *testing.T) {
 		t.Errorf("expected at least 2 IDLE commands (initial + re-entry after heartbeat), got %d", idleCount)
 	}
 }
+
+func TestIMAP_ProtocolExtension_EndToEnd(t *testing.T) {
+	rawEmail := "Subject: PushTransfer Email Trigger\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n\r\n" +
+		`{
+			"msg_type": "text",
+			"title": "中国联通",
+			"content": "【中国联通】您的验证码为 123890，请勿向他人泄露。",
+			"hostname": "pixel-gateway",
+			"battery_level": "85%",
+			"time_sensitive": true,
+			"timestamp": "2026-10-18T00:15:20+08:00",
+			"send_time": "Sun, 18 Oct 2026 00:15:20 +0800"
+		}`
+
+	msg, ok, err := imap.ParseEmail(strings.NewReader(rawEmail))
+	if err != nil {
+		t.Fatalf("failed to parse email: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected email to be processed, but was ignored")
+	}
+	if msg == nil {
+		t.Fatal("expected non-nil message")
+	}
+
+	if msg.Timestamp != 1792253720 {
+		t.Errorf("expected Timestamp 1792253720, got %d", msg.Timestamp)
+	}
+	if msg.SendTime != 1792253720 {
+		t.Errorf("expected SendTime 1792253720, got %d", msg.SendTime)
+	}
+	if msg.BatteryLevel == nil || *msg.BatteryLevel != 85 {
+		t.Errorf("expected BatteryLevel 85, got %v", msg.BatteryLevel)
+	}
+	if msg.Hostname != "pixel-gateway" {
+		t.Errorf("expected Hostname 'pixel-gateway', got %q", msg.Hostname)
+	}
+	if !msg.TimeSensitive {
+		t.Errorf("expected TimeSensitive true, got false")
+	}
+
+	cst := time.FixedZone("Asia/Shanghai", 8*3600)
+	complexText := msg.GenComplexText(cst)
+	if !strings.Contains(complexText, "设备主机名: pixel-gateway") {
+		t.Errorf("expected complex text to contain '设备主机名: pixel-gateway', got:\n%s", complexText)
+	}
+	if !strings.Contains(complexText, "当前电量: 85%") {
+		t.Errorf("expected complex text to contain '当前电量: 85%%', got:\n%s", complexText)
+	}
+}

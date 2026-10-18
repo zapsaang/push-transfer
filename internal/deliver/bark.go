@@ -202,6 +202,8 @@ func (b *BarkDeliver) Send(ctx context.Context, msg *model.Message) error {
 		// a JSON number is ignored by the iOS client, silently falling back to 5.
 		// See LevelProcessor.swift setCriticalSound / bark.day.app params#volume.
 		basePayload["volume"] = "5"
+	} else if msg.TimeSensitive {
+		basePayload["level"] = "timeSensitive"
 	}
 
 	var errs []error

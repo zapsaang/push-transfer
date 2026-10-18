@@ -40,9 +40,11 @@ func (c *ConsoleDeliver) Send(_ context.Context, msg *model.Message) error {
 	l.Info("console deliver",
 		"msg_type", string(msg.MsgType),
 		"app_name", msg.AppName,
+		"hostname", msg.Hostname,
 		"title", msg.Title,
 		"content", msg.Content,
 		"captcha", msg.CaptchaCode,
+		"time_sensitive", msg.TimeSensitive,
 		"emergency", msg.Emergency,
 		"text", msg.GenComplexText(),
 	)

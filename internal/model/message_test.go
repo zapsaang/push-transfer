@@ -24,6 +24,11 @@ func TestFlexibleTimestamp(t *testing.T) {
 		{"string null", `{"time": "null"}`, 0},
 		{"string whitespace", `{"time": "   "}`, 0},
 		{"non-numeric string", `{"time": "invalid_date"}`, 0},
+		{"float seconds unquoted", `{"time": 1700000000.5}`, 1700000000},
+		{"float seconds quoted", `{"time": "1700000000.5"}`, 1700000000},
+		{"float milliseconds quoted", `{"time": "1700000000123.4"}`, 1700000000},
+		{"extreme float overflow unquoted", `{"time": 1e25}`, 0},
+		{"extreme float overflow quoted", `{"time": "1e25"}`, 0},
 	}
 
 	for _, tc := range testCases {
@@ -37,6 +42,179 @@ func TestFlexibleTimestamp(t *testing.T) {
 			}
 			if wrapper.Time != tc.expected {
 				t.Fatalf("expected timestamp %d, got %d", tc.expected, wrapper.Time)
+			}
+		})
+	}
+}
+
+func TestFlexibleTimestamp_ISO8601(t *testing.T) {
+	// Expected Unix timestamp: 2026-10-18T00:15:20+08:00 = 1792253720
+	const expected FlexibleTimestamp = 1792253720
+
+	testCases := []struct {
+		name  string
+		input string
+	}{
+		{"RFC3339 standard", `{"time": "2026-10-18T00:15:20+08:00"}`},
+		{"UTC Z", `{"time": "2026-10-17T16:15:20Z"}`},
+		{"dot fractional seconds", `{"time": "2026-10-18T00:15:20.123456+08:00"}`},
+		{"comma fractional seconds", `{"time": "2026-10-18T00:15:20,123+08:00"}`},
+		{"compact offset", `{"time": "2026-10-18T00:15:20+0800"}`},
+		{"compact hour only offset", `{"time": "2026-10-18T00:15:20+08"}`},
+		{"space separator with colon zone", `{"time": "2026-10-18 00:15:20+08:00"}`},
+		{"space separator with compact zone", `{"time": "2026-10-18 00:15:20+0800"}`},
+		{"space separator with hour only zone", `{"time": "2026-10-18 00:15:20+08"}`},
+		{"space before zone", `{"time": "2026-10-18 00:15:20 +08:00"}`},
+		{"space before compact zone", `{"time": "2026-10-18 00:15:20 +0800"}`},
+		{"space before hour only zone", `{"time": "2026-10-18 00:15:20 +08"}`},
+		{"JSON unicode escape", `{"time": "2026-10-18T00:15:20\u002b08:00"}`},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var wrapper struct {
+				Time FlexibleTimestamp `json:"time"`
+			}
+			err := json.Unmarshal([]byte(tc.input), &wrapper)
+			if err != nil {
+				t.Fatalf("unexpected unmarshal error: %v", err)
+			}
+			if wrapper.Time != expected {
+				t.Fatalf("expected timestamp %d, got %d for input %s", expected, wrapper.Time, tc.input)
+			}
+		})
+	}
+}
+
+func TestFlexibleTimestamp_ISO8601_LocalTimezone(t *testing.T) {
+	cst := time.FixedZone("Asia/Shanghai", 8*3600)
+	utc := time.UTC
+
+	testCases := []struct {
+		name     string
+		input    string
+		loc      *time.Location
+		expected int64
+	}{
+		{
+			name:     "CST space separated",
+			input:    `"2026-10-18 00:15:20"`,
+			loc:      cst,
+			expected: time.Date(2026, 10, 18, 0, 15, 20, 0, cst).Unix(),
+		},
+		{
+			name:     "UTC space separated",
+			input:    `"2026-10-18 00:15:20"`,
+			loc:      utc,
+			expected: time.Date(2026, 10, 18, 0, 15, 20, 0, utc).Unix(),
+		},
+		{
+			name:     "CST T separated",
+			input:    `"2026-10-18T00:15:20"`,
+			loc:      cst,
+			expected: time.Date(2026, 10, 18, 0, 15, 20, 0, cst).Unix(),
+		},
+		{
+			name:     "CST comma fractional",
+			input:    `"2026-10-18 00:15:20,500"`,
+			loc:      cst,
+			expected: time.Date(2026, 10, 18, 0, 15, 20, 0, cst).Unix(),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, err := parseFlexibleTimestamp([]byte(tc.input), tc.loc)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if int64(ts) != tc.expected {
+				t.Fatalf("expected %d, got %d", tc.expected, ts)
+			}
+		})
+	}
+}
+
+func TestFlexibleTimestamp_RFC5322(t *testing.T) {
+	cst := time.FixedZone("Asia/Shanghai", 8*3600)
+	expectedCST := time.Date(2026, 10, 18, 0, 15, 20, 0, cst).Unix()
+
+	testCases := []struct {
+		name     string
+		input    string
+		expected int64
+	}{
+		{
+			name:     "standard RFC5322",
+			input:    `{"time": "Sun, 18 Oct 2026 00:15:20 +0800"}`,
+			expected: expectedCST,
+		},
+		{
+			name:     "single digit day",
+			input:    `{"time": "Sun, 4 Oct 2026 00:15:20 +0800"}`,
+			expected: time.Date(2026, 10, 4, 0, 15, 20, 0, cst).Unix(),
+		},
+		{
+			name:     "without weekday",
+			input:    `{"time": "18 Oct 2026 00:15:20 +0800"}`,
+			expected: expectedCST,
+		},
+		{
+			name:     "without seconds",
+			input:    `{"time": "18 Oct 2026 00:15 +0800"}`,
+			expected: time.Date(2026, 10, 18, 0, 15, 0, 0, cst).Unix(),
+		},
+		{
+			name:     "timezone comment",
+			input:    `{"time": "Sun, 18 Oct 2026 00:15:20 +0800 (CST)"}`,
+			expected: expectedCST,
+		},
+		{
+			name:     "2-digit year (obs-year)",
+			input:    `{"time": "18 Oct 26 00:15:20 +0800"}`,
+			expected: expectedCST,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var wrapper struct {
+				Time FlexibleTimestamp `json:"time"`
+			}
+			err := json.Unmarshal([]byte(tc.input), &wrapper)
+			if err != nil {
+				t.Fatalf("unexpected unmarshal error: %v", err)
+			}
+			if int64(wrapper.Time) != tc.expected {
+				t.Fatalf("expected timestamp %d, got %d for input %s", tc.expected, wrapper.Time, tc.input)
+			}
+		})
+	}
+}
+
+func TestFlexibleTimestamp_InvalidFallbacks(t *testing.T) {
+	testCases := []struct {
+		name  string
+		input string
+	}{
+		{"invalid month and day", `{"time": "2023-13-45T99:99:99Z"}`},
+		{"garbage string", `{"time": "not-a-date"}`},
+		{"date only", `{"time": "2023-11-15"}`},
+		{"empty string", `{"time": ""}`},
+		{"string null", `{"time": "null"}`},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var wrapper struct {
+				Time FlexibleTimestamp `json:"time"`
+			}
+			err := json.Unmarshal([]byte(tc.input), &wrapper)
+			if err != nil {
+				t.Fatalf("unexpected unmarshal error: %v", err)
+			}
+			if wrapper.Time != 0 {
+				t.Fatalf("expected timestamp 0 for invalid input %s, got %d", tc.input, wrapper.Time)
 			}
 		})
 	}
@@ -117,6 +295,271 @@ func TestMessage_UnmarshalJSON(t *testing.T) {
 	}
 	if msg.CaptchaCode != "952701" {
 		t.Errorf("expected CaptchaCode '952701', got %q", msg.CaptchaCode)
+	}
+}
+
+func TestMessage_BatteryLevel_FlexibleUnmarshal(t *testing.T) {
+	intPtr := func(v int) *int { return &v }
+
+	testCases := []struct {
+		name     string
+		input    string
+		expected *int
+	}{
+		{"omitted", `{"msg_type":"text","title":"test","content":"hi"}`, nil},
+		{"explicit null", `{"msg_type":"text","title":"test","content":"hi","battery_level":null}`, nil},
+		{"integer 85", `{"msg_type":"text","title":"test","content":"hi","battery_level":85}`, intPtr(85)},
+		{"integer 0", `{"msg_type":"text","title":"test","content":"hi","battery_level":0}`, intPtr(0)},
+		{"string 85", `{"msg_type":"text","title":"test","content":"hi","battery_level":"85"}`, intPtr(85)},
+		{"string 85 percent", `{"msg_type":"text","title":"test","content":"hi","battery_level":"85%"}`, intPtr(85)},
+		{"string with spaces and percent", `{"msg_type":"text","title":"test","content":"hi","battery_level":" 85 % "}`, intPtr(85)},
+		{"float string 85.0", `{"msg_type":"text","title":"test","content":"hi","battery_level":"85.0"}`, intPtr(85)},
+		{"float string with percent 85.0%", `{"msg_type":"text","title":"test","content":"hi","battery_level":"85.0%"}`, intPtr(85)},
+		{"empty string", `{"msg_type":"text","title":"test","content":"hi","battery_level":""}`, nil},
+		{"whitespace string", `{"msg_type":"text","title":"test","content":"hi","battery_level":"   "}`, nil},
+		{"string null", `{"msg_type":"text","title":"test","content":"hi","battery_level":"null"}`, nil},
+		{"invalid string", `{"msg_type":"text","title":"test","content":"hi","battery_level":"unknown"}`, nil},
+		{"string NaN", `{"msg_type":"text","title":"test","content":"hi","battery_level":"NaN"}`, nil},
+		{"string Infinity", `{"msg_type":"text","title":"test","content":"hi","battery_level":"Infinity"}`, nil},
+		{"string +Inf", `{"msg_type":"text","title":"test","content":"hi","battery_level":"+Inf"}`, nil},
+		{"string -Inf", `{"msg_type":"text","title":"test","content":"hi","battery_level":"-Inf"}`, nil},
+		{"negative integer -1", `{"msg_type":"text","title":"test","content":"hi","battery_level":-1}`, nil},
+		{"negative string -1", `{"msg_type":"text","title":"test","content":"hi","battery_level":"-1"}`, nil},
+		{"integer over 100", `{"msg_type":"text","title":"test","content":"hi","battery_level":105}`, nil},
+		{"string over 100", `{"msg_type":"text","title":"test","content":"hi","battery_level":"120%"}`, nil},
+		{"boundary 100", `{"msg_type":"text","title":"test","content":"hi","battery_level":100}`, intPtr(100)},
+		{"float rounded 85.6%", `{"msg_type":"text","title":"test","content":"hi","battery_level":"85.6%"}`, intPtr(86)},
+		{"float rounded 85.4%", `{"msg_type":"text","title":"test","content":"hi","battery_level":"85.4%"}`, intPtr(85)},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var msg Message
+			err := json.Unmarshal([]byte(tc.input), &msg)
+			if err != nil {
+				t.Fatalf("unexpected unmarshal error: %v", err)
+			}
+			if tc.expected == nil {
+				if msg.BatteryLevel != nil {
+					t.Fatalf("expected nil BatteryLevel for %s, got %d", tc.input, *msg.BatteryLevel)
+				}
+			} else {
+				if msg.BatteryLevel == nil {
+					t.Fatalf("expected BatteryLevel %d for %s, got nil", *tc.expected, tc.input)
+				}
+				if *msg.BatteryLevel != *tc.expected {
+					t.Fatalf("expected BatteryLevel %d for %s, got %d", *tc.expected, tc.input, *msg.BatteryLevel)
+				}
+			}
+		})
+	}
+}
+
+func TestMessage_TimeSensitiveAndHostname_UnmarshalAndClone(t *testing.T) {
+	// 1. UnmarshalJSON with hostname and time_sensitive
+	payload := `{
+		"msg_type": "text",
+		"title": "Bank",
+		"content": "Code 1234",
+		"hostname": "Pixel-8",
+		"time_sensitive": true,
+		"battery_level": 90
+	}`
+
+	var msg Message
+	if err := json.Unmarshal([]byte(payload), &msg); err != nil {
+		t.Fatalf("UnmarshalJSON failed: %v", err)
+	}
+	if msg.Hostname != "Pixel-8" {
+		t.Errorf("expected Hostname 'Pixel-8', got %q", msg.Hostname)
+	}
+	if !msg.TimeSensitive {
+		t.Errorf("expected TimeSensitive true, got false")
+	}
+
+	// 2. SetTimeSensitive method including nil receiver protection
+	var nilMsg *Message
+	nilMsg.SetTimeSensitive(true) // should not panic
+
+	msg.SetTimeSensitive(false)
+	if msg.TimeSensitive {
+		t.Errorf("expected TimeSensitive false after SetTimeSensitive(false)")
+	}
+	msg.SetTimeSensitive(true)
+	if !msg.TimeSensitive {
+		t.Errorf("expected TimeSensitive true after SetTimeSensitive(true)")
+	}
+
+	// 3. Clone deep copy isolation
+	if nilMsg.Clone() != nil {
+		t.Errorf("expected nil for nilMsg.Clone()")
+	}
+
+	cloned := msg.Clone()
+	if cloned == nil {
+		t.Fatalf("expected cloned to be non-nil")
+	}
+	if cloned.Hostname != msg.Hostname || cloned.TimeSensitive != msg.TimeSensitive {
+		t.Errorf("cloned fields do not match original")
+	}
+
+	// Mutate clone and ensure original is not affected
+	cloned.Hostname = "iPhone-16"
+	cloned.TimeSensitive = false
+	newBatt := 50
+	cloned.BatteryLevel = &newBatt
+
+	if msg.Hostname != "Pixel-8" {
+		t.Errorf("original Hostname mutated: %q", msg.Hostname)
+	}
+	if !msg.TimeSensitive {
+		t.Errorf("original TimeSensitive mutated to false")
+	}
+	if *msg.BatteryLevel != 90 {
+		t.Errorf("original BatteryLevel mutated: %d", *msg.BatteryLevel)
+	}
+}
+
+func TestMessage_GenComplexText_HostnameAndBatteryMatrix(t *testing.T) {
+	cst := time.FixedZone("Asia/Shanghai", 8*3600)
+	batt := 85
+
+	// Four states for text message
+	// State 1: Neither hostname nor battery_level
+	msg1 := Message{
+		MsgType:      MsgTypeText,
+		Title:        "10086",
+		Content:      "Notice",
+		TransmitTime: 1700000000,
+		ReceiveTime:  1700000010,
+	}
+	expected1 := "Notice\n\n短信来自: 10086\n\n发送时间：2023-11-15 06:13:20\n转发时间：2023-11-15 06:13:30\n"
+	if got := msg1.GenComplexText(cst); got != expected1 {
+		t.Fatalf("State 1 mismatch:\nwant:\n%q\ngot:\n%q", expected1, got)
+	}
+
+	// State 2: battery_level only (100% byte-for-byte backward compatible)
+	msg2 := Message{
+		MsgType:      MsgTypeText,
+		Title:        "10086",
+		Content:      "Notice",
+		BatteryLevel: &batt,
+		TransmitTime: 1700000000,
+		ReceiveTime:  1700000010,
+	}
+	expected2 := "Notice\n\n短信来自: 10086\n\n发送时间：2023-11-15 06:13:20\n转发时间：2023-11-15 06:13:30\n\n当前电量: 85%\n"
+	if got := msg2.GenComplexText(cst); got != expected2 {
+		t.Fatalf("State 2 mismatch:\nwant:\n%q\ngot:\n%q", expected2, got)
+	}
+
+	// State 3: hostname only
+	msg3 := Message{
+		MsgType:      MsgTypeText,
+		Title:        "10086",
+		Content:      "Notice",
+		Hostname:     "Pixel-8",
+		TransmitTime: 1700000000,
+		ReceiveTime:  1700000010,
+	}
+	expected3 := "Notice\n\n短信来自: 10086\n\n发送时间：2023-11-15 06:13:20\n转发时间：2023-11-15 06:13:30\n\n设备主机名: Pixel-8\n"
+	if got := msg3.GenComplexText(cst); got != expected3 {
+		t.Fatalf("State 3 mismatch:\nwant:\n%q\ngot:\n%q", expected3, got)
+	}
+
+	// State 4: both hostname and battery_level
+	msg4 := Message{
+		MsgType:      MsgTypeText,
+		Title:        "10086",
+		Content:      "Notice",
+		Hostname:     "Pixel-8",
+		BatteryLevel: &batt,
+		TransmitTime: 1700000000,
+		ReceiveTime:  1700000010,
+	}
+	expected4 := "Notice\n\n短信来自: 10086\n\n发送时间：2023-11-15 06:13:20\n转发时间：2023-11-15 06:13:30\n\n设备主机名: Pixel-8\n当前电量: 85%\n"
+	if got := msg4.GenComplexText(cst); got != expected4 {
+		t.Fatalf("State 4 mismatch:\nwant:\n%q\ngot:\n%q", expected4, got)
+	}
+
+	// Sanitization of newline/tab characters in hostname (anti-injection)
+	msgDirty := Message{
+		MsgType:      MsgTypeText,
+		Title:        "10086",
+		Content:      "Notice",
+		Hostname:     " Pixel-8\r\nFake-Header: evil\tphone  ",
+		BatteryLevel: &batt,
+		TransmitTime: 1700000000,
+		ReceiveTime:  1700000010,
+	}
+	expectedDirty := "Notice\n\n短信来自: 10086\n\n发送时间：2023-11-15 06:13:20\n转发时间：2023-11-15 06:13:30\n\n设备主机名: Pixel-8 Fake-Header: evil phone\n当前电量: 85%\n"
+	if got := msgDirty.GenComplexText(cst); got != expectedDirty {
+		t.Fatalf("Sanitization mismatch:\nwant:\n%q\ngot:\n%q", expectedDirty, got)
+	}
+
+	// Whitespace-only hostname should be suppressed
+	msgWhitespace := Message{
+		MsgType:      MsgTypeText,
+		Title:        "10086",
+		Content:      "Notice",
+		Hostname:     "  \r\n\t  ",
+		BatteryLevel: &batt,
+		TransmitTime: 1700000000,
+		ReceiveTime:  1700000010,
+	}
+	if got := msgWhitespace.GenComplexText(cst); got != expected2 {
+		t.Fatalf("Whitespace hostname should be ignored:\nwant:\n%q\ngot:\n%q", expected2, got)
+	}
+
+	// Empty text body (e.g. default type with empty title and content) with metadata should not have leading newline
+	msgEmptyBody := Message{
+		Hostname:     "Gateway-Node",
+		BatteryLevel: &batt,
+	}
+	expectedEmptyBody := "设备主机名: Gateway-Node\n当前电量: 85%\n"
+	if got := msgEmptyBody.GenComplexText(cst); got != expectedEmptyBody {
+		t.Fatalf("Empty body with metadata mismatch:\nwant:\n%q\ngot:\n%q", expectedEmptyBody, got)
+	}
+
+	// Call message with hostname and battery
+	msgCall := Message{
+		MsgType:      MsgTypeCall,
+		Title:        "13800138000",
+		Hostname:     "Pixel-8",
+		BatteryLevel: &batt,
+		IncomingTime: 1700000000,
+	}
+	expectedCall := "未接来电：13800138000\n\n来电时间：2023-11-15 06:13:20\n\n设备主机名: Pixel-8\n当前电量: 85%\n"
+	if got := msgCall.GenComplexText(cst); got != expectedCall {
+		t.Fatalf("Call with metadata mismatch:\nwant:\n%q\ngot:\n%q", expectedCall, got)
+	}
+
+	// AppNotification message with hostname
+	msgApp := Message{
+		MsgType:   MsgTypeAppNotification,
+		AppName:   "WeChat",
+		Title:     "Friend",
+		Content:   "Hello",
+		Hostname:  "Pixel-8",
+		Timestamp: 1700000000,
+	}
+	expectedApp := "【WeChat】Friend\n\nHello\n\n通知时间：2023-11-15 06:13:20\n\n设备主机名: Pixel-8\n"
+	if got := msgApp.GenComplexText(cst); got != expectedApp {
+		t.Fatalf("AppNotification with metadata mismatch:\nwant:\n%q\ngot:\n%q", expectedApp, got)
+	}
+
+	// AppNotification message with hostname and battery
+	msgAppBoth := Message{
+		MsgType:      MsgTypeAppNotification,
+		AppName:      "WeChat",
+		Title:        "Friend",
+		Content:      "Hello",
+		Hostname:     "Pixel-8",
+		BatteryLevel: &batt,
+		Timestamp:    1700000000,
+	}
+	expectedAppBoth := "【WeChat】Friend\n\nHello\n\n通知时间：2023-11-15 06:13:20\n\n设备主机名: Pixel-8\n当前电量: 85%\n"
+	if got := msgAppBoth.GenComplexText(cst); got != expectedAppBoth {
+		t.Fatalf("AppNotification with both metadata mismatch:\nwant:\n%q\ngot:\n%q", expectedAppBoth, got)
 	}
 }
 
@@ -565,5 +1008,46 @@ func TestMessage_Clone_AppNotification(t *testing.T) {
 	cloned.AppName = "钉钉"
 	if orig.AppName != "微信" {
 		t.Fatalf("mutating cloned.AppName affected orig.AppName: got %q", orig.AppName)
+	}
+}
+
+func TestMessage_UnmarshalJSON_NilReceiver(t *testing.T) {
+	var m *Message
+	err := m.UnmarshalJSON([]byte(`{"content":"test"}`))
+	if err == nil {
+		t.Fatal("expected error when unmarshaling into nil *Message receiver, got nil")
+	}
+}
+
+func TestFlexibleTimestamp_UnmarshalJSON_NilReceiver(t *testing.T) {
+	var ft *FlexibleTimestamp
+	err := ft.UnmarshalJSON([]byte(`1700000000`))
+	if err == nil {
+		t.Fatal("expected error when unmarshaling into nil *FlexibleTimestamp receiver, got nil")
+	}
+}
+
+func TestSanitizeSingleLine_ControlCharacters(t *testing.T) {
+	input := "Host\x00\x08Name\x1b[31mEvil\x07"
+	got := sanitizeSingleLine(input)
+	for _, r := range got {
+		if r < 32 || r == 127 {
+			t.Fatalf("sanitizeSingleLine left control character %q in %q", r, got)
+		}
+	}
+	if !strings.Contains(got, "Host") || !strings.Contains(got, "Name") {
+		t.Fatalf("sanitizeSingleLine stripped valid characters: got %q", got)
+	}
+}
+
+func TestSanitizeSingleLine_UnicodeLineTerminators(t *testing.T) {
+	input := "Pixel-8\u2028Fake: injected\u2029More: evil\u0085NEL"
+	got := sanitizeSingleLine(input)
+	if strings.ContainsAny(got, "\u2028\u2029\u0085\r\n") {
+		t.Fatalf("sanitizeSingleLine allowed Unicode line terminators: got %q", got)
+	}
+	expected := "Pixel-8 Fake: injected More: evil NEL"
+	if got != expected {
+		t.Fatalf("expected %q, got %q", expected, got)
 	}
 }

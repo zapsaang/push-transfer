@@ -1257,3 +1257,90 @@ func TestWebhook_AppNotification_EndToEnd_ConcurrentDispatch(t *testing.T) {
 		}
 	}
 }
+
+type captureDeliverer struct {
+	mu  sync.Mutex
+	msg *model.Message
+}
+
+func (c *captureDeliverer) Deliver(_ context.Context, msg *model.Message) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.msg = msg.Clone()
+	return nil
+}
+
+func TestWebhook_ProtocolExtension_EndToEnd(t *testing.T) {
+	pipe, err := pipeline.NewPipelineFromRules(config.RulesConfig{
+		Captcha: []string{`验证码[是为：:]*\s*(\d{4,6})`},
+	}, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to create pipeline: %v", err)
+	}
+
+	capture := &captureDeliverer{}
+	token := "token-e2e"
+
+	h := webhook.NewHandler(webhook.HandlerOptions{
+		Credentials: []config.Credential{{Token: token}},
+		Processor:   pipe,
+		Deliverer:   capture,
+	})
+
+	payload := `{
+		"msg_type": "text",
+		"title": "招商银行",
+		"content": "【招商银行】您的验证码是 654321，5分钟内有效。",
+		"hostname": "pixel-gateway",
+		"battery_level": "85%",
+		"time_sensitive": true,
+		"timestamp": "2026-10-18T00:15:20+08:00",
+		"send_time": "Sun, 18 Oct 2026 00:15:20 +0800"
+	}`
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(payload))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	capture.mu.Lock()
+	delivered := capture.msg
+	capture.mu.Unlock()
+
+	if delivered == nil {
+		t.Fatal("expected delivered message, got nil")
+	}
+
+	if delivered.Timestamp != 1792253720 {
+		t.Errorf("expected Timestamp 1792253720, got %d", delivered.Timestamp)
+	}
+	if delivered.SendTime != 1792253720 {
+		t.Errorf("expected SendTime 1792253720, got %d", delivered.SendTime)
+	}
+	if delivered.BatteryLevel == nil || *delivered.BatteryLevel != 85 {
+		t.Errorf("expected BatteryLevel 85, got %v", delivered.BatteryLevel)
+	}
+	if delivered.Hostname != "pixel-gateway" {
+		t.Errorf("expected Hostname 'pixel-gateway', got %q", delivered.Hostname)
+	}
+	if !delivered.TimeSensitive {
+		t.Errorf("expected TimeSensitive true, got false")
+	}
+	if delivered.CaptchaCode != "654321" {
+		t.Errorf("expected CaptchaCode '654321', got %q", delivered.CaptchaCode)
+	}
+
+	cst := time.FixedZone("Asia/Shanghai", 8*3600)
+	complexText := delivered.GenComplexText(cst)
+	if !strings.Contains(complexText, "设备主机名: pixel-gateway") {
+		t.Errorf("expected complex text to contain '设备主机名: pixel-gateway', got:\n%s", complexText)
+	}
+	if !strings.Contains(complexText, "当前电量: 85%") {
+		t.Errorf("expected complex text to contain '当前电量: 85%%', got:\n%s", complexText)
+	}
+}
