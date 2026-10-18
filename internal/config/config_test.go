@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestConfig_OptionalChannels(t *testing.T) {
@@ -1326,6 +1327,109 @@ func TestConfig_LogLevel(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "LOG_LEVEL") {
 				t.Errorf("expected error message to mention LOG_LEVEL, got %v", err)
+			}
+		})
+	}
+}
+
+func TestConfig_Timezone(t *testing.T) {
+	t.Run("default unset", func(t *testing.T) {
+		cfg, err := LoadFromLookup(func(string) string { return "" })
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Timezone != "" {
+			t.Errorf("expected empty Timezone, got %q", cfg.Timezone)
+		}
+		if cfg.TimeLocation != nil {
+			t.Errorf("expected nil TimeLocation, got %v", cfg.TimeLocation)
+		}
+	})
+
+	validCases := []struct {
+		name       string
+		envKey     string
+		raw        string
+		wantOffset int
+	}{
+		{"IANA Asia/Shanghai", "TIMEZONE", "Asia/Shanghai", 8 * 3600},
+		{"IANA America/New_York", "TIMEZONE", "America/New_York", -5 * 3600},
+		{"TZ fallback Asia/Shanghai", "TZ", "Asia/Shanghai", 8 * 3600},
+		{"Offset plus 08:00", "TIMEZONE", "+08:00", 8 * 3600},
+		{"Offset plus 0800", "TIMEZONE", "+0800", 8 * 3600},
+		{"Offset plus 8", "TIMEZONE", "+8", 8 * 3600},
+		{"Offset minus 05:00", "TIMEZONE", "-05:00", -5 * 3600},
+		{"Offset minus 5", "TIMEZONE", "-5", -5 * 3600},
+		{"Prefix UTC+8", "TIMEZONE", "UTC+8", 8 * 3600},
+		{"Prefix GMT+08:00", "TIMEZONE", "GMT+08:00", 8 * 3600},
+		{"Offset half hour India", "TIMEZONE", "+05:30", 5*3600 + 1800},
+		{"POSIX colon prefix Asia/Shanghai", "TZ", ":Asia/Shanghai", 8 * 3600},
+	}
+
+	for _, tc := range validCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := LoadFromLookup(func(k string) string {
+				if k == tc.envKey {
+					return tc.raw
+				}
+				return ""
+			})
+			if err != nil {
+				t.Fatalf("unexpected error for %s=%q: %v", tc.envKey, tc.raw, err)
+			}
+			if cfg.TimeLocation == nil {
+				t.Fatalf("expected non-nil TimeLocation for %q", tc.raw)
+			}
+			refTime := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+			_, offset := refTime.In(cfg.TimeLocation).Zone()
+			if offset != tc.wantOffset {
+				t.Errorf("expected offset %d, got %d for %q", tc.wantOffset, offset, tc.raw)
+			}
+		})
+	}
+
+	t.Run("TIMEZONE takes precedence over TZ", func(t *testing.T) {
+		cfg, err := LoadFromLookup(func(k string) string {
+			if k == "TIMEZONE" {
+				return "Asia/Shanghai"
+			}
+			if k == "TZ" {
+				return "America/New_York"
+			}
+			return ""
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Timezone != "Asia/Shanghai" {
+			t.Errorf("expected Timezone 'Asia/Shanghai', got %q", cfg.Timezone)
+		}
+	})
+
+	invalidCases := []struct {
+		envKey string
+		raw    string
+	}{
+		{"TIMEZONE", "Invalid/Timezone"},
+		{"TIMEZONE", "+25:00"},
+		{"TIMEZONE", "+08:60"},
+		{"TIMEZONE", "invalid"},
+		{"TIMEZONE", "++8"},
+		{"TZ", "Invalid/Zone_From_TZ"},
+	}
+	for _, tc := range invalidCases {
+		t.Run("invalid_"+tc.envKey+"_"+tc.raw, func(t *testing.T) {
+			_, err := LoadFromLookup(func(k string) string {
+				if k == tc.envKey {
+					return tc.raw
+				}
+				return ""
+			})
+			if err == nil {
+				t.Fatalf("expected error for invalid %s=%q, got nil", tc.envKey, tc.raw)
+			}
+			if !strings.Contains(err.Error(), tc.envKey) {
+				t.Errorf("expected error message to mention %s, got %v", tc.envKey, err)
 			}
 		})
 	}

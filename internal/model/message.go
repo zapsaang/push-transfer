@@ -182,6 +182,7 @@ type Message struct {
 	TimeSensitive bool              `json:"time_sensitive,omitempty"`
 	Emergency     bool              `json:"emergency,omitempty"`
 	CaptchaCode   string            `json:"captcha_code,omitempty"`
+	timeLocation  *time.Location
 }
 
 func parseBatteryLevel(raw []byte) *int {
@@ -227,7 +228,7 @@ func parseBatteryLevel(raw []byte) *int {
 	return nil
 }
 
-func parseTimeSensitive(raw []byte) bool {
+func parseFlexibleBool(raw []byte) bool {
 	str := strings.TrimSpace(string(raw))
 	if str == "" || str == "null" {
 		return false
@@ -250,7 +251,15 @@ func parseTimeSensitive(raw []byte) bool {
 		return val
 	}
 
-	// 2. Fallback: float representation (e.g., 1.0, 1e0 or "1.0" -> true, 0.0, 0e0 or "0.0" -> false)
+	// 2. Localized and natural language boolean representations (case-insensitive)
+	switch strings.ToLower(str) {
+	case "是", "真", "对", "yes", "y", "on", "enable", "enabled":
+		return true
+	case "否", "假", "错", "no", "n", "off", "disable", "disabled":
+		return false
+	}
+
+	// 3. Fallback: float representation (e.g., 1.0, 1e0 or "1.0" -> true, 0.0, 0e0 or "0.0" -> false)
 	if f, err := strconv.ParseFloat(str, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 		if f == 1.0 {
 			return true
@@ -263,7 +272,40 @@ func parseTimeSensitive(raw []byte) bool {
 	return false
 }
 
-// UnmarshalJSON unmarshals JSON into Message with flexible battery_level and time_sensitive parsing,
+func parseTimeSensitive(raw []byte) bool {
+	return parseFlexibleBool(raw)
+}
+
+func parseEmergency(raw []byte) bool {
+	return parseFlexibleBool(raw)
+}
+
+func extractExplicitTimeLocation(raw []byte) *time.Location {
+	str := strings.TrimSpace(string(raw))
+	if len(str) >= 2 && str[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return nil
+		}
+		str = strings.TrimSpace(s)
+	}
+	if str == "" || str == "null" {
+		return nil
+	}
+
+	normStr := normalizeISO8601FractionComma(str)
+	for _, layout := range iso8601WithZoneLayouts {
+		if t, err := time.Parse(layout, normStr); err == nil {
+			return t.Location()
+		}
+	}
+	if t, err := mail.ParseDate(str); err == nil {
+		return t.Location()
+	}
+	return nil
+}
+
+// UnmarshalJSON unmarshals JSON into Message with flexible battery_level, time_sensitive, and emergency parsing,
 // while preserving existing fields on the struct when omitted in the incoming JSON.
 func (m *Message) UnmarshalJSON(b []byte) error {
 	if m == nil {
@@ -280,6 +322,7 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 		Alias
 		BatteryLevel  json.RawMessage `json:"battery_level,omitempty"`
 		TimeSensitive json.RawMessage `json:"time_sensitive,omitempty"`
+		Emergency     json.RawMessage `json:"emergency,omitempty"`
 	}{
 		Alias: clonedAlias,
 	}
@@ -293,6 +336,29 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 	}
 	if len(raw.TimeSensitive) > 0 {
 		m.TimeSensitive = parseTimeSensitive(raw.TimeSensitive)
+	}
+	if len(raw.Emergency) > 0 {
+		m.Emergency = parseEmergency(raw.Emergency)
+	}
+
+	// Preserve existing timeLocation if not overridden by incoming payload
+	m.timeLocation = clonedAlias.timeLocation
+	var timeRaw struct {
+		Timestamp    json.RawMessage `json:"timestamp,omitempty"`
+		SendTime     json.RawMessage `json:"send_time,omitempty"`
+		ReceiveTime  json.RawMessage `json:"receive_time,omitempty"`
+		TransmitTime json.RawMessage `json:"transmit_time,omitempty"`
+		IncomingTime json.RawMessage `json:"incoming_time,omitempty"`
+	}
+	if err := json.Unmarshal(b, &timeRaw); err == nil {
+		for _, rawTS := range [][]byte{timeRaw.Timestamp, timeRaw.ReceiveTime, timeRaw.SendTime, timeRaw.TransmitTime, timeRaw.IncomingTime} {
+			if len(rawTS) > 0 {
+				if loc := extractExplicitTimeLocation(rawTS); loc != nil {
+					m.timeLocation = loc
+					break
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -321,6 +387,25 @@ func (m *Message) SetTimeSensitive(timeSensitive bool) {
 	m.TimeSensitive = timeSensitive
 }
 
+// TimeLocation returns the explicit timezone extracted from incoming timestamps, if any.
+func (m *Message) TimeLocation() *time.Location {
+	if m == nil {
+		return nil
+	}
+	return m.timeLocation
+}
+
+// SetDefaultTimeLocation sets the fallback timezone location for this message
+// only if no explicit timezone was present in incoming timestamps.
+func (m *Message) SetDefaultTimeLocation(loc *time.Location) {
+	if m == nil || loc == nil {
+		return
+	}
+	if m.timeLocation == nil {
+		m.timeLocation = loc
+	}
+}
+
 // Clone returns a deep copy of Message so concurrent delivery targets cannot mutate shared state.
 func (m *Message) Clone() *Message {
 	if m == nil {
@@ -331,6 +416,7 @@ func (m *Message) Clone() *Message {
 		batt := *m.BatteryLevel
 		cloned.BatteryLevel = &batt
 	}
+	cloned.timeLocation = m.timeLocation
 	return &cloned
 }
 
@@ -352,6 +438,8 @@ func (m *Message) GenComplexText(loc ...*time.Location) string {
 	var l *time.Location
 	if len(loc) > 0 && loc[0] != nil {
 		l = loc[0]
+	} else if m.timeLocation != nil {
+		l = m.timeLocation
 	}
 
 	var text string

@@ -1625,3 +1625,83 @@ func TestRun_LogLevel_Debug(t *testing.T) {
 		t.Errorf("expected debug log with raw body in logs, got:\n%s", logs)
 	}
 }
+
+func TestRun_Timezone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var buf bytes.Buffer
+	readyCh := make(chan string, 1)
+
+	env := map[string]string{
+		"PORT":             "0",
+		"RUN_MODE":         "webhook",
+		"AUTH_CREDENTIALS": `[{"name":"test","token":"tz-token"}]`,
+		"TIMEZONE":         "Asia/Shanghai",
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(ctx, nil, &buf, func(k string) string { return env[k] }, readyCh)
+	}()
+
+	var addr string
+	select {
+	case addr = <-readyCh:
+	case err := <-errCh:
+		t.Fatalf("run exited before ready: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for server ready")
+	}
+
+	// 1700000000 is 2023-11-14 22:13:20 UTC -> 2023-11-15 06:13:20 in Asia/Shanghai
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/webhook", bytes.NewBufferString(`{"msg_type":"text","title":"10086","content":"test timezone","timestamp":1700000000}`))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer tz-token")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("POST /webhook failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected nil on shutdown, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for run to exit")
+	}
+
+	logs := buf.String()
+	if !strings.Contains(logs, "timezone=Asia/Shanghai") {
+		t.Errorf("expected timezone=Asia/Shanghai in startup logs, got:\n%s", logs)
+	}
+	if !strings.Contains(logs, "2023-11-15 06:13:20") {
+		t.Errorf("expected 2023-11-15 06:13:20 in console deliver logs, got:\n%s", logs)
+	}
+}
+
+func TestRun_InvalidTimezone_FailFast(t *testing.T) {
+	var buf bytes.Buffer
+	env := map[string]string{
+		"RUN_MODE":         "webhook",
+		"AUTH_CREDENTIALS": `[{"name":"test","token":"tz-token"}]`,
+		"TIMEZONE":         "Invalid/Nonexistent_Timezone",
+	}
+
+	err := run(context.Background(), nil, &buf, func(k string) string { return env[k] })
+	if err == nil {
+		t.Fatal("expected run() to fail with invalid TIMEZONE, got nil")
+	}
+	if !strings.Contains(err.Error(), "TIMEZONE") {
+		t.Errorf("expected error to mention TIMEZONE, got: %v", err)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -179,16 +180,18 @@ func (m RunMode) StartsIMAP() bool {
 // Config represents the application configuration tree.
 // Optional channel configurations are nil when unconfigured.
 type Config struct {
-	Server   ServerConfig
-	Auth     AuthConfig
-	Bark     *BarkConfig
-	Telegram *TelegramConfig
-	Email    *EmailConfig
-	IMAP     *IMAPConfig
-	Crypto   *CryptoConfig
-	Rules    RulesConfig
-	RunMode  RunMode
-	LogLevel slog.Level
+	Server       ServerConfig
+	Auth         AuthConfig
+	Bark         *BarkConfig
+	Telegram     *TelegramConfig
+	Email        *EmailConfig
+	IMAP         *IMAPConfig
+	Crypto       *CryptoConfig
+	Rules        RulesConfig
+	RunMode      RunMode
+	LogLevel     slog.Level
+	Timezone     string
+	TimeLocation *time.Location
 }
 
 // Load loads the configuration from system environment variables.
@@ -247,6 +250,17 @@ func LoadFromLookup(lookup func(string) string) (*Config, error) {
 		}
 	}
 
+	timezoneRaw := strings.TrimSpace(lookup("TIMEZONE"))
+	timezoneSource := "TIMEZONE"
+	if timezoneRaw == "" {
+		timezoneRaw = strings.TrimSpace(lookup("TZ"))
+		timezoneSource = "TZ"
+	}
+	timeLoc, err := parseTimezone(timezoneRaw, timezoneSource)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Server: ServerConfig{
 			Port:           port,
@@ -255,8 +269,10 @@ func LoadFromLookup(lookup func(string) string) (*Config, error) {
 		Auth: AuthConfig{
 			Credentials: authCreds,
 		},
-		RunMode:  mode,
-		LogLevel: logLevel,
+		RunMode:      mode,
+		LogLevel:     logLevel,
+		Timezone:     timezoneRaw,
+		TimeLocation: timeLoc,
 	}
 
 	// 2. Telegram Config (Optional)
@@ -445,6 +461,101 @@ func parseJSONRegexList(val, name string) ([]string, error) {
 	}
 
 	return rawItems, nil
+}
+
+// parseTimezone parses a timezone name or offset string into a *time.Location.
+// If val is empty, it returns nil, nil.
+func parseTimezone(val, name string) (*time.Location, error) {
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" {
+		return nil, nil
+	}
+
+	// 1. Try standard IANA timezone name (support optional POSIX leading colon, e.g. ":Asia/Shanghai")
+	cleanName := strings.TrimPrefix(trimmed, ":")
+	if loc, err := time.LoadLocation(cleanName); err == nil {
+		return loc, nil
+	}
+
+	// 2. Try UTC / GMT offset, e.g. "+08:00", "+0800", "+08", "+8", "-05:00", "-0500", "-05", "-5", "UTC+8", "GMT+08:00"
+	if loc, ok := parseUTCOffset(trimmed); ok {
+		return loc, nil
+	}
+
+	return nil, fmt.Errorf("environment variable %s must be a valid IANA time zone (e.g. \"Asia/Shanghai\") or UTC offset (e.g. \"+08:00\"), got %q", name, val)
+}
+
+func parseUTCOffset(s string) (*time.Location, bool) {
+	orig := s
+	upper := strings.ToUpper(s)
+	if strings.HasPrefix(upper, "UTC") {
+		s = s[3:]
+	} else if strings.HasPrefix(upper, "GMT") {
+		s = s[3:]
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, false
+	}
+
+	sign := 1
+	switch s[0] {
+	case '+':
+		s = s[1:]
+	case '-':
+		sign = -1
+		s = s[1:]
+	default:
+		return nil, false
+	}
+	if s == "" || s[0] == '+' || s[0] == '-' {
+		return nil, false
+	}
+
+	var hours, minutes int
+	if strings.Contains(s, ":") {
+		parts := strings.Split(s, ":")
+		if len(parts) != 2 {
+			return nil, false
+		}
+		var err error
+		hours, err = strconv.Atoi(parts[0])
+		if err != nil {
+			return nil, false
+		}
+		minutes, err = strconv.Atoi(parts[1])
+		if err != nil {
+			return nil, false
+		}
+	} else {
+		switch len(s) {
+		case 1, 2:
+			var err error
+			hours, err = strconv.Atoi(s)
+			if err != nil {
+				return nil, false
+			}
+		case 4:
+			var err error
+			hours, err = strconv.Atoi(s[:2])
+			if err != nil {
+				return nil, false
+			}
+			minutes, err = strconv.Atoi(s[2:])
+			if err != nil {
+				return nil, false
+			}
+		default:
+			return nil, false
+		}
+	}
+
+	if hours < 0 || hours > 23 || minutes < 0 || minutes > 59 {
+		return nil, false
+	}
+
+	totalSeconds := sign * (hours*3600 + minutes*60)
+	return time.FixedZone(orig, totalSeconds), true
 }
 
 const (

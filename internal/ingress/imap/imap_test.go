@@ -2204,3 +2204,101 @@ func TestListener_DebugLogging_TriggerEmail(t *testing.T) {
 		t.Errorf("expected debug log about parsed trigger email, got:\n%s", logStr)
 	}
 }
+
+func TestListener_TimeLocation_AppliedToTriggerMessage(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
+
+	go func() {
+		r := bufio.NewReader(serverConn)
+		writeLine := func(s string) {
+			_, _ = serverConn.Write([]byte(s))
+		}
+
+		writeLine("* OK IMAP4rev1 Service Ready\r\n")
+
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				return
+			}
+			parts := strings.Fields(line)
+			if len(parts) < 2 {
+				continue
+			}
+			tag := parts[0]
+			cmd := parts[1]
+			upperCmd := strings.ToUpper(strings.TrimSpace(line[len(tag)+1:]))
+
+			switch {
+			case strings.HasPrefix(upperCmd, "CAPABILITY"):
+				writeLine("* CAPABILITY IMAP4rev1 IDLE\r\n" + tag + " OK CAPABILITY completed\r\n")
+			case cmd == "LOGIN":
+				writeLine(tag + " OK LOGIN completed\r\n")
+			case cmd == "SELECT":
+				writeLine("* 1 EXISTS\r\n" + tag + " OK [READ-WRITE] SELECT completed\r\n")
+			case strings.HasPrefix(upperCmd, "UID SEARCH"):
+				writeLine("* SEARCH 101\r\n" + tag + " OK UID SEARCH completed\r\n")
+			case strings.HasPrefix(upperCmd, "UID FETCH"):
+				body := "From: test@example.com\r\nSubject: PushTransfer Email Trigger\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{\"msg_type\":\"text\",\"title\":\"10086\",\"content\":\"Hello\",\"timestamp\":1700000000}"
+				msg := fmt.Sprintf("* 1 FETCH (UID 101 BODY[] {%d}\r\n%s)\r\n%s OK UID FETCH completed\r\n", len(body), body, tag)
+				writeLine(msg)
+			case strings.HasPrefix(upperCmd, "UID STORE"):
+				writeLine(tag + " OK UID STORE completed\r\n")
+			case strings.HasPrefix(upperCmd, "IDLE"):
+				writeLine("+ idling\r\n")
+				doneLine, errDone := r.ReadString('\n')
+				if errDone != nil {
+					return
+				}
+				if strings.TrimRight(doneLine, "\r\n") == "DONE" {
+					writeLine(tag + " OK IDLE completed\r\n")
+				}
+			case strings.HasPrefix(upperCmd, "LOGOUT"):
+				writeLine("* BYE Logging out\r\n" + tag + " OK LOGOUT completed\r\n")
+				return
+			}
+		}
+	}()
+
+	shanghai := time.FixedZone("Asia/Shanghai", 8*3600)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var capturedMsg *model.Message
+	var mu sync.Mutex
+
+	listener := imap.NewListener(imap.ListenerOptions{
+		IMAPServer:   "127.0.0.1",
+		IMAPPort:     9993,
+		LoginEmail:   "test@example.com",
+		Password:     "secret",
+		TimeLocation: shanghai,
+		DialConn: func(_ context.Context, _ string) (net.Conn, error) {
+			return clientConn, nil
+		},
+		Handler: func(_ context.Context, m *model.Message) error {
+			mu.Lock()
+			capturedMsg = m.Clone()
+			mu.Unlock()
+			cancel()
+			return nil
+		},
+	})
+
+	_ = listener.Start(ctx)
+
+	mu.Lock()
+	msg := capturedMsg
+	mu.Unlock()
+
+	if msg == nil {
+		t.Fatal("expected message to be handled, got nil")
+	}
+	text := msg.GenComplexText()
+	// 1700000000 in Asia/Shanghai is 2023-11-15 06:13:20
+	if !strings.Contains(text, "2023-11-15 06:13:20") {
+		t.Errorf("expected complex text to format in Asia/Shanghai (2023-11-15 06:13:20), got:\n%s", text)
+	}
+}

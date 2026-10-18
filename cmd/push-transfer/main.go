@@ -127,6 +127,10 @@ func run(ctx context.Context, args []string, stdout io.Writer, lookup func(strin
 
 	levelVar.Set(cfg.LogLevel)
 
+	if cfg.TimeLocation != nil {
+		logger.Info("configured timezone", "timezone", cfg.Timezone)
+	}
+
 	// 3. Evaluate run modes before constructing anything. This is the startup contract (see
 	// AGENTS.md contract 3): a missing RUN_MODE, or a mode whose prerequisites are not met, must
 	// fail fail-fast before the pipeline, HTTP clients and delivery targets are built, so the
@@ -173,13 +177,14 @@ func run(ctx context.Context, args []string, stdout io.Writer, lookup func(strin
 		}
 
 		imapListener := imap.NewListener(imap.ListenerOptions{
-			IMAPServer: cfg.IMAP.IMAPServer,
-			IMAPPort:   cfg.IMAP.IMAPPort,
-			LoginEmail: cfg.IMAP.LoginEmail,
-			Password:   cfg.IMAP.Password,
-			Mailbox:    cfg.IMAP.Mailbox,
-			Handler:    imapHandler,
-			Logger:     logger,
+			IMAPServer:   cfg.IMAP.IMAPServer,
+			IMAPPort:     cfg.IMAP.IMAPPort,
+			LoginEmail:   cfg.IMAP.LoginEmail,
+			Password:     cfg.IMAP.Password,
+			Mailbox:      cfg.IMAP.Mailbox,
+			Handler:      imapHandler,
+			TimeLocation: cfg.TimeLocation,
+			Logger:       logger,
 		})
 
 		wg.Add(1)
@@ -213,6 +218,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, lookup func(strin
 			TrustedProxies: cfg.Server.TrustedProxies,
 			Processor:      pipe,
 			Deliverer:      dispatcher,
+			TimeLocation:   cfg.TimeLocation,
 			Logger:         logger,
 		})
 

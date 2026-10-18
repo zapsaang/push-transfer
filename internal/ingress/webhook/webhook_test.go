@@ -1515,6 +1515,10 @@ func TestWebhook_TimeSensitive_FlexibleVariants(t *testing.T) {
 		{"integer 0", `0`, false},
 		{"string 1", `"1"`, true},
 		{"string 0", `"0"`, false},
+		{"chinese shi 是", `"是"`, true},
+		{"chinese fou 否", `"否"`, false},
+		{"english yes", `"yes"`, true},
+		{"english no", `"no"`, false},
 	}
 
 	for _, tc := range testCases {
@@ -1561,4 +1565,142 @@ func TestWebhook_TimeSensitive_FlexibleVariants(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWebhook_AppNotification_LocalizedFieldsAndExplicitTimezone(t *testing.T) {
+	pipe, err := pipeline.NewPipelineFromRules(config.RulesConfig{}, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to create pipeline: %v", err)
+	}
+	capture := &captureDeliverer{}
+	token := "device-sec-token"
+
+	h := webhook.NewHandler(webhook.HandlerOptions{
+		Credentials: []config.Credential{{Token: token}},
+		Processor:   pipe,
+		Deliverer:   capture,
+	})
+
+	mockLogJSON := `{"content":"AlertBot:[Prod][High][cpu_usage]\nCPU usage exceeds 90%","battery_level":"79","hostname":"TestDevice01","title":"Production System Alerts","msg_type":"app_notification","timestamp":"2026-10-18T18:36:44+08:00","app_name":"AlertHub","time_sensitive":"否"}`
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(mockLogJSON))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	capture.mu.Lock()
+	delivered := capture.msg
+	capture.mu.Unlock()
+
+	if delivered == nil {
+		t.Fatal("expected delivered message, got nil")
+	}
+
+	if delivered.MsgType != model.MsgTypeAppNotification {
+		t.Errorf("expected MsgType %q, got %q", model.MsgTypeAppNotification, delivered.MsgType)
+	}
+	if delivered.AppName != "AlertHub" {
+		t.Errorf("expected AppName 'AlertHub', got %q", delivered.AppName)
+	}
+	if delivered.Title != "Production System Alerts" {
+		t.Errorf("expected Title 'Production System Alerts', got %q", delivered.Title)
+	}
+	if delivered.BatteryLevel == nil || *delivered.BatteryLevel != 79 {
+		t.Errorf("expected BatteryLevel 79, got %v", delivered.BatteryLevel)
+	}
+	if delivered.Hostname != "TestDevice01" {
+		t.Errorf("expected Hostname 'TestDevice01', got %q", delivered.Hostname)
+	}
+	if delivered.TimeSensitive != false {
+		t.Errorf("expected TimeSensitive false for '否', got true")
+	}
+
+	cst := time.FixedZone("Asia/Shanghai", 8*3600)
+	complexText := delivered.GenComplexText(cst)
+	if !strings.Contains(complexText, "【AlertHub】Production System Alerts") {
+		t.Errorf("expected header in complexText, got:\n%s", complexText)
+	}
+	if !strings.Contains(complexText, "设备主机名: TestDevice01") {
+		t.Errorf("expected hostname in complexText, got:\n%s", complexText)
+	}
+	if !strings.Contains(complexText, "当前电量: 79%") {
+		t.Errorf("expected battery in complexText, got:\n%s", complexText)
+	}
+}
+
+func TestWebhook_Timezone_FallbackLocation(t *testing.T) {
+	pipe, err := pipeline.NewPipelineFromRules(config.RulesConfig{}, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to create pipeline: %v", err)
+	}
+	capture := &captureDeliverer{}
+	token := "tz-token"
+	shanghai := time.FixedZone("Asia/Shanghai", 8*3600)
+
+	h := webhook.NewHandler(webhook.HandlerOptions{
+		Credentials:  []config.Credential{{Token: token}},
+		Processor:    pipe,
+		Deliverer:    capture,
+		TimeLocation: shanghai,
+	})
+
+	t.Run("numeric timestamp adopts HandlerOptions.TimeLocation", func(t *testing.T) {
+		capture.mu.Lock()
+		capture.msg = nil
+		capture.mu.Unlock()
+
+		// 1700000000 is 2023-11-14 22:13:20 UTC, which is 2023-11-15 06:13:20 in Asia/Shanghai
+		body := `{"msg_type":"text","title":"10086","content":"Hello","timestamp":1700000000}`
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+		capture.mu.Lock()
+		delivered := capture.msg
+		capture.mu.Unlock()
+		if delivered == nil {
+			t.Fatal("expected delivered message, got nil")
+		}
+
+		text := delivered.GenComplexText()
+		if !strings.Contains(text, "2023-11-15 06:13:20") {
+			t.Errorf("expected formatted time in Asia/Shanghai (2023-11-15 06:13:20), got text:\n%s", text)
+		}
+	})
+
+	t.Run("explicit ISO8601 timezone in input is preserved and not overridden", func(t *testing.T) {
+		capture.mu.Lock()
+		capture.msg = nil
+		capture.mu.Unlock()
+
+		body := `{"msg_type":"text","title":"10086","content":"Hello","timestamp":"2023-11-14T17:13:20-05:00"}`
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+		capture.mu.Lock()
+		delivered := capture.msg
+		capture.mu.Unlock()
+		if delivered == nil {
+			t.Fatal("expected delivered message, got nil")
+		}
+
+		text := delivered.GenComplexText()
+		if !strings.Contains(text, "2023-11-14 17:13:20") {
+			t.Errorf("expected explicit input timezone to be preserved (2023-11-14 17:13:20), got text:\n%s", text)
+		}
+	})
 }

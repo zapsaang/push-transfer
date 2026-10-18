@@ -77,6 +77,7 @@ type ListenerOptions struct {
 	PollInterval      time.Duration // default: 30 * time.Second
 	MinBackoff        time.Duration // default: 1 * time.Second
 	MaxBackoff        time.Duration // default: 60 * time.Second
+	TimeLocation      *time.Location
 	Logger            *slog.Logger
 }
 
@@ -455,6 +456,9 @@ func (l *Listener) processUnseen(ctx context.Context, client *imapclient.Client)
 			l.logger.Debug("leaving non-trigger email unseen", "uid", uid, "subject", subject)
 			continue
 		default:
+			if l.opts.TimeLocation != nil {
+				msg.SetDefaultTimeLocation(l.opts.TimeLocation)
+			}
 			l.logger.Debug("imap parsed trigger email",
 				"uid", uid,
 				"msg_type", string(msg.MsgType),

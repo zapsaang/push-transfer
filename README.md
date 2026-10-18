@@ -291,6 +291,8 @@ PushTransfer 遵循 **12-Factor 原则**，所有配置均通过环境变量进�
 |----------|--------|------|
 | `RUN_MODE` | _(必填，无默认)_ | 进程运行模式枚举（大小写不敏感，三选一）：<br>• `webhook`：只启动 HTTP 服务（`/webhook` + `/healthz`），要求 `AUTH_CREDENTIALS` 含至少一条可用凭据，忽略 `EMAIL_TRIGGER_*`（若存在则输出 `WARN`）<br>• `imap`：只启动 IMAP 后台监听，**不监听任何 HTTP 端口**，要求完整 `EMAIL_TRIGGER_LOGIN_EMAIL` + `EMAIL_TRIGGER_PASSWORD`，且若同时配置了 `AUTH_CREDENTIALS` 会 fail-fast 报错<br>• `both`：同时启动 HTTP 服务与 IMAP 监听，要求凭据与完整 IMAP 配置同时具备<br>未设置或传入其他值（含旧版 `RUN_TRIGGER` 布尔值）时启动即报错退出 |
 | `PORT` | `8889` | HTTP Webhook 服务监听端口（兼容别名 `SERVER_PORT`；仅 `RUN_MODE=webhook` 或 `both` 时生效） |
+| `LOG_LEVEL` | `info` | 结构化日志输出级别（大小写不敏感）：`debug`、`info`、`warn`、`error`。设为 `debug` 时将输出 Webhook 原始请求体 JSON 与详细处理流程 |
+| `TIMEZONE` | _(跟随系统/UTC)_ | 时区配置（兼容别名 `TZ`）。支持标准 IANA 时区名称（如 `Asia/Shanghai`、`America/New_York`）或 UTC 偏移量（如 `+08:00`、`+0800`、`+8`、`-05:00`、`UTC+8`）。当输入时间戳为秒/毫秒纯数字或未携带显式时区时，按此配置时区渲染排版时间 |
 
 #### 2. Webhook 接入鉴权与网络代理
 | 环境变量 | 默认值 | 说明 |
@@ -419,8 +421,8 @@ Authorization: Bearer <你的 token>   # AUTH_CREDENTIALS 中某个条目的 tok
 | `content` | string | 否 | 通知或短信正文内容（`call` 类型可为空） |
 | `hostname` | string | 否 | 发送端设备主机名/标识（如 `"Pixel-8"`）。在 Telegram、Email 正文末尾及 Console 结构化日志/文本中展示（`设备主机名: ...`）；Bark 显式不携带以保持横幅精简 |
 | `battery_level` | int/str | 否 | 发送端设备当前剩余电量百分比。自适应兼容数值（`85`、`0`）、带百分号或浮点字符串（`"85%"`、`"85.0"`、`" 85 % "`）；空串或非法值安全降级为 `nil`（不误显电量行） |
-| `time_sensitive` | bool/str/int | 否 | 时效性通知标记。自适应兼容布尔值（`true`/`false`）、字符串（`"true"`/`"false"`、`"1"`/`"0"`）及数字（`1`/`0`）；非法值安全降级为 `false`。为 `true` 时 Bark `level` 设置为 `timeSensitive`（iOS 突破专注模式但不破物理静音；若同时为 `emergency` 则紧急优先保持 `critical` 强警报）。若正文命中验证码提取规则，系统自动富化为 `true` |
-| `timestamp` | int/str | 否 | 通用时间戳。系统具备防御性容错，自动兼容秒（10位）、毫秒（13位）、字符串数字、ISO 8601 格式化日期字符串（支持显式时区、无时区本地时间、逗号小数秒与 Unicode 转义）及 RFC 5322 / RFC 2822 邮件格式日期字符串；非法值静默降级为 `0` |
+| `time_sensitive` | bool/str/int | 否 | 时效性通知标记。自适应兼容原生布尔值（`true`/`false`）、数值（`1`/`0`、`1.0`/`0.0`）、英文字符串（`"true"`/`"false"`、`"1"`/`"0"`、`"yes"`/`"no"`、`"y"`/`"n"`、`"on"`/`"off"`、`"enable"`/`"disable"`）及本地化中文字符串（`"是"`/`"否"`、`"真"`/`"假"`、`"对"`/`"错"`）；非法值安全降级为 `false`。为 `true` 时 Bark `level` 设置为 `timeSensitive`（iOS 突破专注模式但不破物理静音；若同时为 `emergency` 则紧急优先保持 `critical` 强警报）。若正文命中验证码提取规则，系统自动富化为 `true` |
+| `timestamp` | int/str | 否 | 通用时间戳。系统具备防御性容错，自动兼容秒（10位）、毫秒（13位）、字符串数字、ISO 8601 格式化日期字符串（支持显式时区、无时区本地时间、逗号小数秒与 Unicode 转义）及 RFC 5322 / RFC 2822 邮件格式日期字符串；输入携带显式时区（如 `+08:00`）时排版自动优先继承该时区展示（防止受服务器/容器默认 UTC 零时区影响）；非法值静默降级为 `0` |
 | `send_time` | int/str | 否 | 消息实际发送时间戳（备选回退字段，享受与 `timestamp` 相同的多格式解析与容错能力） |
 | `receive_time` | int/str | 否 | 转发端设备接收时间戳（备选回退字段，享受与 `timestamp` 相同的多格式解析与容错能力） |
 | `transmit_time` | int/str | 否 | 转发端设备转发时间戳（备选回退字段，享受与 `timestamp` 相同的多格式解析与容错能力） |

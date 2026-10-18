@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/zapsaang/push-transfer/internal/config"
 	"github.com/zapsaang/push-transfer/internal/model"
@@ -35,6 +36,7 @@ type HandlerOptions struct {
 	TrustedProxies []string
 	Processor      Processor
 	Deliverer      Deliverer
+	TimeLocation   *time.Location
 	Logger         *slog.Logger
 }
 
@@ -45,6 +47,7 @@ type Handler struct {
 	trustedProxies []*net.IPNet
 	processor      Processor
 	deliverer      Deliverer
+	timeLocation   *time.Location
 	logger         *slog.Logger
 }
 
@@ -73,6 +76,7 @@ func NewHandler(opts HandlerOptions) *Handler {
 		trustedProxies: parseTrustedProxies(opts.TrustedProxies, logger),
 		processor:      opts.Processor,
 		deliverer:      opts.Deliverer,
+		timeLocation:   opts.TimeLocation,
 		logger:         logger,
 	}
 }
@@ -302,6 +306,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"message": "invalid json",
 		})
 		return
+	}
+
+	if h.timeLocation != nil {
+		msg.SetDefaultTimeLocation(h.timeLocation)
 	}
 
 	// Validate msg_type: fail-fast on missing or invalid msg_type (ADR-05)

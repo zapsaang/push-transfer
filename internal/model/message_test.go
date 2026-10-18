@@ -399,6 +399,22 @@ func TestMessage_TimeSensitive_FlexibleUnmarshal(t *testing.T) {
 		{"raw token with spaces 0", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":  0  }`, false},
 		{"raw token with spaces true", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":  true  }`, true},
 		{"raw token with spaces false", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":  false  }`, false},
+		{"chinese shi 是", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"是"}`, true},
+		{"chinese fou 否", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"否"}`, false},
+		{"chinese zhen 真", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"真"}`, true},
+		{"chinese jia 假", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"假"}`, false},
+		{"chinese dui 对", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"对"}`, true},
+		{"chinese cuo 错", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"错"}`, false},
+		{"english yes", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"yes"}`, true},
+		{"english no", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"no"}`, false},
+		{"english YES uppercase", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"YES"}`, true},
+		{"english NO uppercase", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"NO"}`, false},
+		{"english y", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"y"}`, true},
+		{"english n", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"n"}`, false},
+		{"english on", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"on"}`, true},
+		{"english off", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":"off"}`, false},
+		{"chinese with spaces 是", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":" 是 "}`, true},
+		{"chinese with spaces 否", `{"msg_type":"text","title":"test","content":"hi","time_sensitive":" 否 "}`, false},
 	}
 
 	for _, tc := range testCases {
@@ -1337,5 +1353,148 @@ func TestMessage_UnmarshalJSON_EdgeCases(t *testing.T) {
 	}
 	if !unknownMsg.TimeSensitive {
 		t.Errorf("expected TimeSensitive to be updated to true, got false")
+	}
+}
+
+func TestMessage_AppNotification_LocalizedFieldsAndExplicitTimezone(t *testing.T) {
+	cst := time.FixedZone("Asia/Shanghai", 8*3600)
+	rawLogJSON := `{
+		"content": "AlertBot:[Prod][High][cpu_usage]\nCPU usage exceeds 90%",
+		"battery_level": "79",
+		"hostname": "TestDevice01",
+		"title": "Production System Alerts",
+		"msg_type": "app_notification",
+		"timestamp": "2026-10-18T18:36:44+08:00",
+		"app_name": "AlertHub",
+		"time_sensitive": "否"
+	}`
+
+	var msg Message
+	if err := json.Unmarshal([]byte(rawLogJSON), &msg); err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+
+	if msg.MsgType != MsgTypeAppNotification {
+		t.Errorf("expected MsgType %q, got %q", MsgTypeAppNotification, msg.MsgType)
+	}
+	if msg.AppName != "AlertHub" {
+		t.Errorf("expected AppName 'AlertHub', got %q", msg.AppName)
+	}
+	if msg.Title != "Production System Alerts" {
+		t.Errorf("expected Title 'Production System Alerts', got %q", msg.Title)
+	}
+	if msg.Content != "AlertBot:[Prod][High][cpu_usage]\nCPU usage exceeds 90%" {
+		t.Errorf("content mismatch, got %q", msg.Content)
+	}
+	if msg.BatteryLevel == nil || *msg.BatteryLevel != 79 {
+		t.Errorf("expected BatteryLevel 79, got %v", msg.BatteryLevel)
+	}
+	if msg.Hostname != "TestDevice01" {
+		t.Errorf("expected Hostname 'TestDevice01', got %q", msg.Hostname)
+	}
+	expectedTime := time.Date(2026, 10, 18, 18, 36, 44, 0, cst).Unix()
+	if int64(msg.Timestamp) != expectedTime {
+		t.Errorf("expected Timestamp %d, got %d", expectedTime, msg.Timestamp)
+	}
+	if msg.TimeSensitive != false {
+		t.Errorf("expected TimeSensitive false for '否', got true")
+	}
+
+	// Verify formatted complex text
+	complexText := msg.GenComplexText(cst)
+	expectedHeader := "【AlertHub】Production System Alerts"
+	if !strings.Contains(complexText, expectedHeader) {
+		t.Errorf("expected complexText to contain %q, got:\n%s", expectedHeader, complexText)
+	}
+	if !strings.Contains(complexText, "通知时间：2026-10-18 18:36:44") {
+		t.Errorf("expected complexText to contain '通知时间：2026-10-18 18:36:44', got:\n%s", complexText)
+	}
+	if !strings.Contains(complexText, "设备主机名: TestDevice01") {
+		t.Errorf("expected complexText to contain '设备主机名: TestDevice01', got:\n%s", complexText)
+	}
+	if !strings.Contains(complexText, "当前电量: 79%") {
+		t.Errorf("expected complexText to contain '当前电量: 79%%', got:\n%s", complexText)
+	}
+
+	// Variant: when time_sensitive is "是"
+	rawLogTimeSensitive := `{
+		"content": "AlertBot:[Prod][High][cpu_usage]\nCPU usage exceeds 90%",
+		"battery_level": "79",
+		"hostname": "TestDevice01",
+		"title": "Production System Alerts",
+		"msg_type": "app_notification",
+		"timestamp": "2026-10-18T18:36:44+08:00",
+		"app_name": "AlertHub",
+		"time_sensitive": "是"
+	}`
+	var msgTS Message
+	if err := json.Unmarshal([]byte(rawLogTimeSensitive), &msgTS); err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+	if !msgTS.TimeSensitive {
+		t.Errorf("expected TimeSensitive true for '是', got false")
+	}
+}
+
+func TestMessage_Emergency_FlexibleUnmarshal(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		{"boolean true", `{"emergency": true}`, true},
+		{"boolean false", `{"emergency": false}`, false},
+		{"string true", `{"emergency": "true"}`, true},
+		{"string false", `{"emergency": "false"}`, false},
+		{"integer 1", `{"emergency": 1}`, true},
+		{"integer 0", `{"emergency": 0}`, false},
+		{"string 1", `{"emergency": "1"}`, true},
+		{"string 0", `{"emergency": "0"}`, false},
+		{"chinese shi 是", `{"emergency": "是"}`, true},
+		{"chinese fou 否", `{"emergency": "否"}`, false},
+		{"chinese zhen 真", `{"emergency": "真"}`, true},
+		{"chinese jia 假", `{"emergency": "假"}`, false},
+		{"english yes", `{"emergency": "yes"}`, true},
+		{"english no", `{"emergency": "no"}`, false},
+		{"null", `{"emergency": null}`, false},
+		{"invalid string", `{"emergency": "invalid"}`, false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var msg Message
+			err := json.Unmarshal([]byte(tc.input), &msg)
+			if err != nil {
+				t.Fatalf("unexpected unmarshal error for %s: %v", tc.input, err)
+			}
+			if msg.Emergency != tc.expected {
+				t.Errorf("expected Emergency %v for input %s, got %v", tc.expected, tc.input, msg.Emergency)
+			}
+		})
+	}
+}
+
+func TestMessage_GenComplexText_InheritsInputTimezone(t *testing.T) {
+	rawLogJSON := `{
+		"content": "AlertBot:[Prod][High][cpu_usage]\nCPU usage exceeds 90%",
+		"title": "Production System Alerts",
+		"msg_type": "app_notification",
+		"timestamp": "2026-10-18T18:36:44+08:00",
+		"app_name": "AlertHub"
+	}`
+
+	var msg Message
+	if err := json.Unmarshal([]byte(rawLogJSON), &msg); err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+
+	// Calling GenComplexText() with no arguments (as in Telegram, Email, Console deliverers)
+	// MUST preserve the input's explicit +08:00 timezone (18:36:44).
+	if msg.TimeLocation() == nil {
+		t.Fatal("expected non-nil TimeLocation from explicit ISO8601 input")
+	}
+	complexText := msg.GenComplexText()
+	if !strings.Contains(complexText, "通知时间：2026-10-18 18:36:44") {
+		t.Fatalf("expected complexText to inherit input timezone and show '18:36:44', but got:\n%s", complexText)
 	}
 }
