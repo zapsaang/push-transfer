@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"mime"
 	"net"
 	"net/smtp"
@@ -22,6 +23,7 @@ type EmailOptions struct {
 	SMTPPort      int
 	Timeout       time.Duration
 	CustomDialer  func(ctx context.Context, network, addr string) (net.Conn, error)
+	Logger        *slog.Logger
 }
 
 // EmailDeliver delivers notifications via SMTP SSL.
@@ -33,6 +35,7 @@ type EmailDeliver struct {
 	smtpPort      int
 	timeout       time.Duration
 	customDialer  func(ctx context.Context, network, addr string) (net.Conn, error)
+	logger        *slog.Logger
 }
 
 // NewEmailDeliver creates an EmailDeliver client.
@@ -53,6 +56,7 @@ func NewEmailDeliver(opts EmailOptions) *EmailDeliver {
 		smtpPort:      port,
 		timeout:       timeout,
 		customDialer:  opts.CustomDialer,
+		logger:        opts.Logger,
 	}
 }
 
@@ -192,5 +196,8 @@ func (e *EmailDeliver) Send(ctx context.Context, msg *model.Message) error {
 	}
 
 	_ = client.Quit()
+	if e.logger != nil {
+		e.logger.Debug("email sent via smtp", "server", addr, "to", receiver, "subject", subject)
+	}
 	return nil
 }

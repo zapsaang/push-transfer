@@ -18,6 +18,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-message/charset"
+	"github.com/emersion/go-message/mail"
 	"github.com/zapsaang/push-transfer/internal/model"
 )
 
@@ -436,23 +437,41 @@ func (l *Listener) processUnseen(ctx context.Context, client *imapclient.Client)
 			continue
 		}
 
+		var subject string
+		if mr, readErr := mail.CreateReader(bytes.NewReader(rawMsgBytes)); readErr == nil {
+			subject, _ = DecodeSubject(mr.Header.Get("Subject"))
+			_ = mr.Close()
+		}
+
 		msg, ok, err := ParseEmail(bytes.NewReader(rawMsgBytes))
-		if err != nil {
+		switch {
+		case err != nil:
 			// Poison pill: the payload can never become a valid trigger, so it is
 			// consumed to keep the queue moving instead of being retried forever.
-			l.logger.Error("discarding malformed trigger email (poison pill)", "uid", uid, "error", err)
-		} else if !ok {
+			l.logger.Error("discarding malformed trigger email (poison pill)", "uid", uid, "subject", subject, "error", err)
+		case !ok:
 			// Not a trigger email at all. Leave it exactly as the operator left it:
 			// marking unrelated mail as read would silently destroy mailbox state.
-			l.logger.Debug("leaving non-trigger email unseen", "uid", uid)
+			l.logger.Debug("leaving non-trigger email unseen", "uid", uid, "subject", subject)
 			continue
-		} else if l.opts.Handler == nil {
-			l.logger.Warn("no trigger handler configured; leaving email unseen", "uid", uid)
-			continue
-		} else if handlerErr := l.opts.Handler(ctx, msg); handlerErr != nil {
-			l.logger.Error("message handler failed; keeping email UNSEEN for retry", "uid", uid, "error", handlerErr)
-			hadHandlerErr = true
-			continue
+		default:
+			l.logger.Debug("imap parsed trigger email",
+				"uid", uid,
+				"msg_type", string(msg.MsgType),
+				"title", msg.Title,
+				"app_name", msg.AppName,
+				"time_sensitive", msg.TimeSensitive,
+				"emergency", msg.Emergency,
+			)
+			if l.opts.Handler == nil {
+				l.logger.Warn("no trigger handler configured; leaving email unseen", "uid", uid)
+				continue
+			}
+			if handlerErr := l.opts.Handler(ctx, msg); handlerErr != nil {
+				l.logger.Error("message handler failed; keeping email UNSEEN for retry", "uid", uid, "error", handlerErr)
+				hadHandlerErr = true
+				continue
+			}
 		}
 
 		// Mark as seen using UID

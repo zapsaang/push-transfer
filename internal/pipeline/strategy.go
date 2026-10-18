@@ -87,6 +87,7 @@ func (p *Pipeline) Process(msg *model.Message) (bool, error) {
 				p.logger.Info("pipeline: message rejected by filter strategy", "title", msg.Title)
 				return false, nil
 			}
+			p.logger.Debug("pipeline: message passed filter stage", "title", msg.Title)
 		}
 
 		// 2. Captcha strategy (enrichment stage)
@@ -94,6 +95,8 @@ func (p *Pipeline) Process(msg *model.Message) (bool, error) {
 			_, err := p.captcha.Process(msg)
 			if err != nil {
 				p.logger.Warn("pipeline: captcha strategy failed", "error", err, "title", msg.Title)
+			} else if msg.CaptchaCode != "" {
+				p.logger.Debug("pipeline: captcha extracted", "title", msg.Title, "code", msg.CaptchaCode, "time_sensitive", msg.TimeSensitive)
 			}
 		}
 
@@ -102,9 +105,18 @@ func (p *Pipeline) Process(msg *model.Message) (bool, error) {
 			_, err := p.emergency.Process(msg)
 			if err != nil {
 				p.logger.Warn("pipeline: emergency strategy failed", "error", err, "title", msg.Title)
+			} else if msg.Emergency {
+				p.logger.Debug("pipeline: emergency marked", "title", msg.Title)
 			}
 		}
 
+		p.logger.Debug("pipeline: message processing complete",
+			"title", msg.Title,
+			"msg_type", string(msg.MsgType),
+			"captcha", msg.CaptchaCode,
+			"time_sensitive", msg.TimeSensitive,
+			"emergency", msg.Emergency,
+		)
 		return true, nil
 
 	default:

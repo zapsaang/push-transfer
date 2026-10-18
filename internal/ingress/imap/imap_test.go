@@ -1204,8 +1204,8 @@ func TestListener_ConsumptionSemanticsAndRetry(t *testing.T) {
 		if seen {
 			t.Error("expected an unrelated (non-trigger) email to keep its UNSEEN state, but UID STORE was issued")
 		}
-		if !strings.Contains(logBuf.String(), "leaving non-trigger email unseen") {
-			t.Errorf("expected a log entry about leaving the non-trigger email unseen, got logs: %s", logBuf.String())
+		if !strings.Contains(logBuf.String(), "leaving non-trigger email unseen") || !strings.Contains(logBuf.String(), "Your monthly invoice") {
+			t.Errorf("expected a log entry about leaving the non-trigger email unseen with subject, got logs: %s", logBuf.String())
 		}
 	})
 
@@ -2110,5 +2110,97 @@ func TestListener_TimeSensitive_EndToEndIntegration(t *testing.T) {
 				t.Errorf("expected email UID 5001 to be marked as \\Seen after successful delivery")
 			}
 		})
+	}
+}
+
+func TestListener_DebugLogging_TriggerEmail(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
+
+	const triggerEmail = "Subject: PushTransfer Email Trigger\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n\r\n" +
+		`{"msg_type":"text","title":"10086","content":"Your balance is low"}`
+
+	go func() {
+		r := bufio.NewReader(serverConn)
+		w := bufio.NewWriter(serverConn)
+		writeLine := func(s string) {
+			_, _ = w.WriteString(s)
+			_ = w.Flush()
+		}
+
+		writeLine("* OK [CAPABILITY IMAP4rev1 IDLE] Mock IMAP Server Ready\r\n")
+
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				return
+			}
+			line = strings.TrimRight(line, "\r\n")
+			parts := strings.SplitN(line, " ", 2)
+			if len(parts) < 2 {
+				continue
+			}
+			tag := parts[0]
+			upperCmd := strings.ToUpper(parts[1])
+
+			switch {
+			case strings.HasPrefix(upperCmd, "CAPABILITY"):
+				writeLine("* CAPABILITY IMAP4rev1 IDLE\r\n" + tag + " OK CAPABILITY completed\r\n")
+			case strings.HasPrefix(upperCmd, "LOGIN"):
+				writeLine(tag + " OK LOGIN completed\r\n")
+			case strings.HasPrefix(upperCmd, "SELECT"):
+				writeLine("* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] UIDs valid\r\n* FLAGS (\\Seen)\r\n* OK [PERMANENTFLAGS (\\Seen)] Flags permitted\r\n" + tag + " OK [READ-WRITE] SELECT completed\r\n")
+			case strings.HasPrefix(upperCmd, "UID SEARCH"):
+				writeLine("* SEARCH 9001\r\n" + tag + " OK UID SEARCH completed\r\n")
+			case strings.HasPrefix(upperCmd, "UID FETCH"):
+				writeLine(fmt.Sprintf("* 1 FETCH (UID 9001 BODY[] {%d}\r\n%s)\r\n%s OK UID FETCH completed\r\n",
+					len(triggerEmail), triggerEmail, tag))
+			case strings.HasPrefix(upperCmd, "UID STORE"):
+				writeLine(tag + " OK UID STORE completed\r\n")
+			case strings.HasPrefix(upperCmd, "IDLE"):
+				writeLine("+ idling\r\n")
+				doneLine, errDone := r.ReadString('\n')
+				if errDone != nil {
+					return
+				}
+				if strings.TrimRight(doneLine, "\r\n") == "DONE" {
+					writeLine(tag + " OK IDLE completed\r\n")
+				}
+			case strings.HasPrefix(upperCmd, "LOGOUT"):
+				writeLine("* BYE Logging out\r\n" + tag + " OK LOGOUT completed\r\n")
+				return
+			}
+		}
+	}()
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	listener := imap.NewListener(imap.ListenerOptions{
+		IMAPServer: "127.0.0.1",
+		IMAPPort:   9993,
+		LoginEmail: "test@example.com",
+		Password:   "secret",
+		Logger:     logger,
+		DialConn: func(_ context.Context, _ string) (net.Conn, error) {
+			return clientConn, nil
+		},
+		Handler: func(_ context.Context, _ *model.Message) error {
+			cancel()
+			return nil
+		},
+	})
+
+	_ = listener.Start(ctx)
+
+	logStr := logBuf.String()
+	if !strings.Contains(logStr, "imap parsed trigger email") ||
+		!strings.Contains(logStr, "title=10086") ||
+		!strings.Contains(logStr, "msg_type=text") {
+		t.Errorf("expected debug log about parsed trigger email, got:\n%s", logStr)
 	}
 }

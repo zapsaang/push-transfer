@@ -123,6 +123,12 @@ func (m *mockDeliverer) Deliver(_ context.Context, _ *model.Message) error {
 	return m.err
 }
 
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) {
+	return 0, errors.New("read failed")
+}
+
 func TestWebhook_HTTPStatusCodes(t *testing.T) {
 	const validToken = "secret-token-abc"
 
@@ -338,6 +344,158 @@ func TestWebhook_HTTPStatusCodes(t *testing.T) {
 
 		if rec.Code != http.StatusRequestEntityTooLarge {
 			t.Fatalf("expected status 413 Request Entity Too Large, got %d", rec.Code)
+		}
+	})
+
+	t.Run("body read error (not MaxBytesError) -> 400 Bad Request", func(t *testing.T) {
+		h := webhook.NewHandler(webhook.HandlerOptions{
+			Credentials: []config.Credential{{Token: validToken}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
+		})
+
+		req := httptest.NewRequest(http.MethodPost, "/webhook", &errReader{})
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400 Bad Request, got %d", rec.Code)
+		}
+		var res map[string]interface{}
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatalf("failed to parse response JSON: %v", err)
+		}
+		if res["status"] != "failed" || res["message"] != "failed to read request body" {
+			t.Errorf("expected failed to read request body, got %v", res)
+		}
+	})
+
+	t.Run("debug logging logs raw request body", func(t *testing.T) {
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+		h := webhook.NewHandler(webhook.HandlerOptions{
+			Credentials: []config.Credential{{Token: validToken}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
+			Logger:      logger,
+		})
+
+		rawJSON := `{"msg_type":"text","title":"10086","content":"test message"}`
+		req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(rawJSON))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d", rec.Code)
+		}
+
+		logStr := logBuf.String()
+		if !strings.Contains(logStr, "webhook raw request body") || !strings.Contains(logStr, "10086") || !strings.Contains(logStr, "test message") {
+			t.Errorf("expected debug log to contain raw JSON, got:\n%s", logStr)
+		}
+	})
+
+	t.Run("debug logging logs raw malformed JSON body before 400", func(t *testing.T) {
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+		h := webhook.NewHandler(webhook.HandlerOptions{
+			Credentials: []config.Credential{{Token: validToken}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
+			Logger:      logger,
+		})
+
+		rawMalformed := `{malformed: json`
+		req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(rawMalformed))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected status 400, got %d", rec.Code)
+		}
+
+		logStr := logBuf.String()
+		if !strings.Contains(logStr, "webhook raw request body") || !strings.Contains(logStr, "malformed") {
+			t.Errorf("expected debug log to contain raw malformed JSON, got:\n%s", logStr)
+		}
+	})
+
+	t.Run("debug logging logs message parsed details", func(t *testing.T) {
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+		h := webhook.NewHandler(webhook.HandlerOptions{
+			Credentials: []config.Credential{{Token: validToken}},
+			Processor:   &mockProcessor{pass: true},
+			Deliverer:   &mockDeliverer{},
+			Logger:      logger,
+		})
+
+		rawJSON := `{"msg_type":"app_notification","app_name":"WeChat","title":"Boss","content":"Meeting now","hostname":"phone-1"}`
+		req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(rawJSON))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d", rec.Code)
+		}
+
+		logStr := logBuf.String()
+		if !strings.Contains(logStr, "webhook message parsed") ||
+			!strings.Contains(logStr, "app_name=WeChat") ||
+			!strings.Contains(logStr, "title=Boss") ||
+			!strings.Contains(logStr, "hostname=phone-1") {
+			t.Errorf("expected parsed message debug log, got:\n%s", logStr)
+		}
+	})
+
+	t.Run("debug logging logs auth failure reason details without leaking credentials", func(t *testing.T) {
+		cases := []struct {
+			name       string
+			authHeader string
+			wantReason string
+		}{
+			{"missing auth header", "", "missing_authorization_header"},
+			{"invalid bearer token", "Bearer wrong-secret", "invalid_bearer_token"},
+			{"invalid basic auth", "Basic dXNlcjp3cm9uZw==", "invalid_basic_credentials"},
+			{"unsupported scheme", "Digest something", "unsupported_authorization_scheme"},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				var logBuf bytes.Buffer
+				logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+				h := webhook.NewHandler(webhook.HandlerOptions{
+					Credentials: []config.Credential{{Token: validToken, Username: "admin", Password: "pwd"}},
+					Logger:      logger,
+				})
+
+				req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(`{}`))
+				if tc.authHeader != "" {
+					req.Header.Set("Authorization", tc.authHeader)
+				}
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+
+				if rec.Code != http.StatusUnauthorized {
+					t.Fatalf("expected 401, got %d", rec.Code)
+				}
+
+				logStr := logBuf.String()
+				if !strings.Contains(logStr, "webhook auth rejected details") || !strings.Contains(logStr, "reason="+tc.wantReason) {
+					t.Errorf("expected reason %s in debug log, got:\n%s", tc.wantReason, logStr)
+				}
+				if strings.Contains(logStr, "wrong-secret") || strings.Contains(logStr, "dXNlcjp3cm9uZw") {
+					t.Errorf("credential leaked in debug log: %s", logStr)
+				}
+			})
 		}
 	})
 }

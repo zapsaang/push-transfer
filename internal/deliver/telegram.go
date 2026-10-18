@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -45,6 +46,7 @@ type TelegramOptions struct {
 	BaseURL    string
 	BotToken   string
 	ChatID     int64
+	Logger     *slog.Logger
 }
 
 // TelegramDeliver delivers formatted messages to Telegram via Bot API.
@@ -53,6 +55,7 @@ type TelegramDeliver struct {
 	baseURL  string
 	botToken string
 	chatID   int64
+	logger   *slog.Logger
 }
 
 // NewTelegramDeliver creates a TelegramDeliver client.
@@ -70,6 +73,7 @@ func NewTelegramDeliver(opts TelegramOptions) *TelegramDeliver {
 		baseURL:  baseURL,
 		botToken: opts.BotToken,
 		chatID:   opts.ChatID,
+		logger:   opts.Logger,
 	}
 }
 
@@ -121,6 +125,10 @@ func (t *TelegramDeliver) Send(ctx context.Context, msg *model.Message) error {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseDrainBytes))
 	if err != nil {
 		return fmt.Errorf("failed to read telegram response: %w", err)
+	}
+
+	if t.logger != nil {
+		t.logger.Debug("telegram send response", "status", resp.StatusCode, "response", string(body))
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

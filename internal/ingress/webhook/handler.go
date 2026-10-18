@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -227,6 +228,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	name, authorized := h.isAuthorized(r)
 	if !authorized {
 		h.logger.Warn("webhook auth failed", "ip", clientIP)
+		var authReason string
+		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+		switch {
+		case authHeader == "":
+			authReason = "missing_authorization_header"
+		case strings.HasPrefix(strings.ToLower(authHeader), "bearer "):
+			authReason = "invalid_bearer_token"
+		case strings.HasPrefix(strings.ToLower(authHeader), "basic "):
+			authReason = "invalid_basic_credentials"
+		default:
+			authReason = "unsupported_authorization_scheme"
+		}
+		h.logger.Debug("webhook auth rejected details", "ip", clientIP, "reason", authReason)
 		// RFC 9110 section 15.5.2 requires a 401 response for HTTP Basic Auth to carry a
 		// challenge, otherwise clients cannot prompt for credentials. Only advertise
 		// Basic when it is actually configured, so token-only deployments do not trigger
@@ -244,22 +258,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.logger.Info("webhook authorized", "ip", clientIP, "credential", name)
 	}
 
-	// 2. Decode JSON body with size limit
+	// 2. Read and decode JSON body with size limit
 	r.Body = http.MaxBytesReader(w, r.Body, h.maxBodyBytes)
 	defer func() { _ = r.Body.Close() }()
 
-	dec := json.NewDecoder(r.Body)
-	var msg model.Message
-	err := dec.Decode(&msg)
-	if err == nil {
-		if extraErr := dec.Decode(&struct{}{}); !errors.Is(extraErr, io.EOF) {
-			if extraErr != nil {
-				err = extraErr
-			} else {
-				err = errors.New("unexpected trailing JSON data")
-			}
-		}
-	}
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
@@ -270,6 +273,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		h.logger.Warn("webhook failed to read body", "ip", clientIP, "error", err)
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"status":  "failed",
+			"message": "failed to read request body",
+		})
+		return
+	}
+
+	h.logger.Debug("webhook raw request body", "ip", clientIP, "body", string(bodyBytes))
+
+	dec := json.NewDecoder(bytes.NewReader(bodyBytes))
+	var msg model.Message
+	err = dec.Decode(&msg)
+	if err == nil {
+		if extraErr := dec.Decode(&struct{}{}); !errors.Is(extraErr, io.EOF) {
+			if extraErr != nil {
+				err = extraErr
+			} else {
+				err = errors.New("unexpected trailing JSON data")
+			}
+		}
+	}
+	if err != nil {
 		h.logger.Warn("webhook invalid json", "ip", clientIP, "error", err)
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"status":  "failed",
@@ -287,6 +313,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	h.logger.Debug("webhook message parsed",
+		"ip", clientIP,
+		"msg_type", string(msg.MsgType),
+		"title", msg.Title,
+		"content_len", len(msg.Content),
+		"app_name", msg.AppName,
+		"hostname", msg.Hostname,
+		"time_sensitive", msg.TimeSensitive,
+		"emergency", msg.Emergency,
+	)
 
 	// 3. Pipeline Processing
 	if h.processor != nil {

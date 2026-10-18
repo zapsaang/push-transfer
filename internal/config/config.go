@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -187,6 +188,7 @@ type Config struct {
 	Crypto   *CryptoConfig
 	Rules    RulesConfig
 	RunMode  RunMode
+	LogLevel slog.Level
 }
 
 // Load loads the configuration from system environment variables.
@@ -228,6 +230,23 @@ func LoadFromLookup(lookup func(string) string) (*Config, error) {
 		return nil, err
 	}
 
+	logLevelStr := strings.TrimSpace(lookup("LOG_LEVEL"))
+	logLevel := slog.LevelInfo
+	if logLevelStr != "" {
+		switch strings.ToLower(logLevelStr) {
+		case "debug":
+			logLevel = slog.LevelDebug
+		case "info":
+			logLevel = slog.LevelInfo
+		case "warn", "warning":
+			logLevel = slog.LevelWarn
+		case "error":
+			logLevel = slog.LevelError
+		default:
+			return nil, fmt.Errorf("environment variable LOG_LEVEL must be one of debug, info, warn, error, got %q", logLevelStr)
+		}
+	}
+
 	cfg := &Config{
 		Server: ServerConfig{
 			Port:           port,
@@ -236,7 +255,8 @@ func LoadFromLookup(lookup func(string) string) (*Config, error) {
 		Auth: AuthConfig{
 			Credentials: authCreds,
 		},
-		RunMode: mode,
+		RunMode:  mode,
+		LogLevel: logLevel,
 	}
 
 	// 2. Telegram Config (Optional)

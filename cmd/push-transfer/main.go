@@ -104,8 +104,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, lookup func(strin
 	}
 
 	// 1. Initialize structured logging
+	var levelVar slog.LevelVar
 	logger := slog.New(slog.NewTextHandler(stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: &levelVar,
 	}))
 
 	logger.Info("starting push-transfer gateway", "version", Version)
@@ -123,6 +124,8 @@ func run(ctx context.Context, args []string, stdout io.Writer, lookup func(strin
 	if err != nil {
 		return fmt.Errorf("failed to load configuration: %w", err)
 	}
+
+	levelVar.Set(cfg.LogLevel)
 
 	// 3. Evaluate run modes before constructing anything. This is the startup contract (see
 	// AGENTS.md contract 3): a missing RUN_MODE, or a mode whose prerequisites are not met, must
@@ -329,6 +332,7 @@ func buildDispatcher(cfg *config.Config, loggers ...*slog.Logger) *deliver.Dispa
 				BaseURL:    cfg.Telegram.BaseURL,
 				BotToken:   cfg.Telegram.BotToken,
 				ChatID:     cfg.Telegram.ChatID,
+				Logger:     logger,
 			})
 			targets = append(targets, tgDeliver)
 			logger.Info("registered deliver target", "name", "telegram", "chat_id", cfg.Telegram.ChatID)
@@ -346,6 +350,7 @@ func buildDispatcher(cfg *config.Config, loggers ...*slog.Logger) *deliver.Dispa
 				Password:      cfg.Email.Password,
 				SMTPServer:    cfg.Email.SMTPServer,
 				SMTPPort:      cfg.Email.SMTPPort,
+				Logger:        logger,
 			})
 			targets = append(targets, emailDeliver)
 			logger.Info("registered deliver target", "name", "email", "smtp_server", cfg.Email.SMTPServer, "port", cfg.Email.SMTPPort)

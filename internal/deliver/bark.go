@@ -288,7 +288,10 @@ func (b *BarkDeliver) postJSON(ctx context.Context, targetURL string, data []byt
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseDrainBytes))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseDrainBytes))
+	if b.logger != nil {
+		b.logger.Debug("bark post response", "url", targetURL, "status", resp.StatusCode, "response", string(respBody))
+	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)

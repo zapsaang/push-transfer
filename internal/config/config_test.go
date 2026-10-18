@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 )
@@ -1258,4 +1259,74 @@ func TestConfig_StandaloneEnvVars_TriggerPartialConfig(t *testing.T) {
 			t.Fatal("expected EmailConfig{SMTPPort: 587}.HasPartialConfig() == true")
 		}
 	})
+}
+
+func TestConfig_LogLevel(t *testing.T) {
+	t.Run("default is info", func(t *testing.T) {
+		cfg, err := LoadFromLookup(func(string) string { return "" })
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.LogLevel != slog.LevelInfo {
+			t.Errorf("expected default LogLevel info (%v), got %v", slog.LevelInfo, cfg.LogLevel)
+		}
+	})
+
+	validCases := []struct {
+		raw  string
+		want slog.Level
+	}{
+		{"debug", slog.LevelDebug},
+		{"DEBUG", slog.LevelDebug},
+		{" Debug ", slog.LevelDebug},
+		{"info", slog.LevelInfo},
+		{"INFO", slog.LevelInfo},
+		{"warn", slog.LevelWarn},
+		{"WARN", slog.LevelWarn},
+		{"warning", slog.LevelWarn},
+		{"WARNING", slog.LevelWarn},
+		{"error", slog.LevelError},
+		{"ERROR", slog.LevelError},
+	}
+
+	for _, tc := range validCases {
+		t.Run("valid_"+tc.raw, func(t *testing.T) {
+			cfg, err := LoadFromLookup(func(k string) string {
+				if k == "LOG_LEVEL" {
+					return tc.raw
+				}
+				return ""
+			})
+			if err != nil {
+				t.Fatalf("unexpected error for %q: %v", tc.raw, err)
+			}
+			if cfg.LogLevel != tc.want {
+				t.Errorf("for LOG_LEVEL=%q expected %v, got %v", tc.raw, tc.want, cfg.LogLevel)
+			}
+		})
+	}
+
+	invalidCases := []string{
+		"trace",
+		"verbose",
+		"fatal",
+		"unknown",
+	}
+
+	for _, raw := range invalidCases {
+		t.Run("invalid_"+raw, func(t *testing.T) {
+			_, err := LoadFromLookup(func(k string) string {
+				if k == "LOG_LEVEL" {
+					return raw
+				}
+				return ""
+			})
+			if err == nil {
+				t.Fatalf("expected error for invalid LOG_LEVEL=%q, got nil", raw)
+			}
+			if !strings.Contains(err.Error(), "LOG_LEVEL") {
+				t.Errorf("expected error message to mention LOG_LEVEL, got %v", err)
+			}
+		})
+	}
 }

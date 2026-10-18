@@ -1985,3 +1985,141 @@ func TestConsoleDeliver_LogHostnameAndTimeSensitive(t *testing.T) {
 		t.Fatalf("expected log text to contain '设备主机名: Node-01', got:\n%s", logOutput)
 	}
 }
+
+func TestDispatcher_DeliverSucceeded_DebugLogging(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	mock := &mockTarget{name: "mock_ok", returnErr: nil}
+	disp := deliver.NewDispatcher(deliver.DispatcherOptions{
+		Targets: []deliver.Target{mock},
+		Timeout: 1 * time.Second,
+		Logger:  logger,
+	})
+
+	err := disp.Deliver(context.Background(), &model.Message{Title: "test"})
+	if err != nil {
+		t.Fatalf("unexpected deliver error: %v", err)
+	}
+
+	logStr := buf.String()
+	if !strings.Contains(logStr, "target deliver succeeded") || !strings.Contains(logStr, "target=mock_ok") || !strings.Contains(logStr, "elapsed=") {
+		t.Errorf("expected debug log for target deliver succeeded, got:\n%s", logStr)
+	}
+}
+
+func TestBarkDeliver_ResponseDebugLogging(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"code":200,"message":"success"}`)
+	}))
+	defer ts.Close()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	bark := deliver.NewBarkDeliver(deliver.BarkOptions{
+		PostURL:    ts.URL,
+		DeviceKeys: []string{"test_key"},
+		Logger:     logger,
+	})
+
+	err := bark.Send(context.Background(), &model.Message{Title: "TestBark"})
+	if err != nil {
+		t.Fatalf("unexpected bark error: %v", err)
+	}
+
+	logStr := buf.String()
+	if !strings.Contains(logStr, "bark post response") || !strings.Contains(logStr, "code") || !strings.Contains(logStr, "200") {
+		t.Errorf("expected bark response debug log, got:\n%s", logStr)
+	}
+}
+
+func TestTelegramDeliver_ResponseDebugLogging(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":99}}`)
+	}))
+	defer ts.Close()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	tg := deliver.NewTelegramDeliver(deliver.TelegramOptions{
+		BaseURL:  ts.URL,
+		BotToken: "test_bot",
+		ChatID:   12345,
+		Logger:   logger,
+	})
+
+	err := tg.Send(context.Background(), &model.Message{Title: "TestTG"})
+	if err != nil {
+		t.Fatalf("unexpected tg error: %v", err)
+	}
+
+	logStr := buf.String()
+	if !strings.Contains(logStr, "telegram send response") || !strings.Contains(logStr, "message_id") || !strings.Contains(logStr, "99") {
+		t.Errorf("expected telegram response debug log, got:\n%s", logStr)
+	}
+}
+
+func TestEmailDeliver_DebugLogging(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	server, clientConn := net.Pipe()
+	defer func() { _ = server.Close() }()
+
+	go func() {
+		defer func() { _ = server.Close() }()
+		_, _ = server.Write([]byte("220 smtp.example.com ESMTP\r\n"))
+		buf := make([]byte, 1024)
+		for {
+			n, err := server.Read(buf)
+			if err != nil {
+				return
+			}
+			cmd := string(buf[:n])
+			switch {
+			case strings.HasPrefix(cmd, "EHLO") || strings.HasPrefix(cmd, "HELO"):
+				_, _ = server.Write([]byte("250-smtp.example.com\r\n250 HELP\r\n"))
+			case strings.HasPrefix(cmd, "MAIL FROM:"):
+				_, _ = server.Write([]byte("250 OK\r\n"))
+			case strings.HasPrefix(cmd, "RCPT TO:"):
+				_, _ = server.Write([]byte("250 OK\r\n"))
+			case strings.HasPrefix(cmd, "DATA"):
+				_, _ = server.Write([]byte("354 Start mail input; end with <CRLF>.<CRLF>\r\n"))
+			case strings.Contains(cmd, "\r\n.\r\n"):
+				_, _ = server.Write([]byte("250 OK\r\n"))
+			case strings.HasPrefix(cmd, "QUIT"):
+				_, _ = server.Write([]byte("221 Bye\r\n"))
+				return
+			default:
+				_, _ = server.Write([]byte("250 OK\r\n"))
+			}
+		}
+	}()
+
+	email := deliver.NewEmailDeliver(deliver.EmailOptions{
+		SenderEmail:   "sender@example.com",
+		ReceiverEmail: "recv@example.com",
+		SMTPServer:    "smtp.example.com",
+		SMTPPort:      465,
+		Logger:        logger,
+		CustomDialer: func(_ context.Context, _, _ string) (net.Conn, error) {
+			return clientConn, nil
+		},
+	})
+
+	err := email.Send(context.Background(), &model.Message{Title: "TestEmail", Content: "Hello"})
+	if err != nil {
+		t.Fatalf("unexpected email error: %v", err)
+	}
+
+	logStr := buf.String()
+	if !strings.Contains(logStr, "email sent via smtp") || !strings.Contains(logStr, "recv@example.com") {
+		t.Errorf("expected email debug log, got:\n%s", logStr)
+	}
+}

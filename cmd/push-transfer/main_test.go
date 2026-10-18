@@ -1565,3 +1565,63 @@ func TestRun_E2E_BasicBytesPreservedThroughConfig(t *testing.T) {
 		t.Fatal("timed out waiting for run to exit")
 	}
 }
+
+func TestRun_LogLevel_Debug(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var buf bytes.Buffer
+	readyCh := make(chan string, 1)
+
+	env := map[string]string{
+		"PORT":             "0",
+		"RUN_MODE":         "webhook",
+		"AUTH_CREDENTIALS": `[{"name":"test","token":"debug-token"}]`,
+		"LOG_LEVEL":        "debug",
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(ctx, nil, &buf, func(k string) string { return env[k] }, readyCh)
+	}()
+
+	var addr string
+	select {
+	case addr = <-readyCh:
+	case err := <-errCh:
+		t.Fatalf("run exited before ready: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for server ready")
+	}
+
+	// Send a valid POST webhook request
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/webhook", bytes.NewBufferString(`{"msg_type":"text","title":"debug-title","content":"hello"}`))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer debug-token")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("POST /webhook failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected nil on shutdown, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for run to exit")
+	}
+
+	logs := buf.String()
+	if !strings.Contains(logs, "level=DEBUG") || !strings.Contains(logs, "debug-title") {
+		t.Errorf("expected debug log with raw body in logs, got:\n%s", logs)
+	}
+}

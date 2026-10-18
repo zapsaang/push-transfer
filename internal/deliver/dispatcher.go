@@ -66,8 +66,9 @@ func (d *Dispatcher) Deliver(ctx context.Context, msg *model.Message) error {
 	}
 
 	type targetResult struct {
-		name string
-		err  error
+		name    string
+		err     error
+		elapsed time.Duration
 	}
 
 	results := make(chan targetResult, len(d.targets))
@@ -75,8 +76,10 @@ func (d *Dispatcher) Deliver(ctx context.Context, msg *model.Message) error {
 		target := t
 		msgClone := msg.Clone()
 		go func() {
+			start := time.Now()
 			err := target.Send(ctx, msgClone)
-			results <- targetResult{name: target.Name(), err: err}
+			elapsed := time.Since(start)
+			results <- targetResult{name: target.Name(), err: err, elapsed: elapsed}
 		}()
 	}
 
@@ -91,10 +94,11 @@ func (d *Dispatcher) Deliver(ctx context.Context, msg *model.Message) error {
 			return ctx.Err()
 		case res := <-results:
 			if res.err != nil {
-				d.logger.Warn("target deliver failed", "target", res.name, "error", res.err)
+				d.logger.Warn("target deliver failed", "target", res.name, "elapsed", res.elapsed, "error", res.err)
 				errs = append(errs, fmt.Errorf("%s: %w", res.name, res.err))
 			} else {
 				successCount++
+				d.logger.Debug("target deliver succeeded", "target", res.name, "elapsed", res.elapsed)
 			}
 		}
 	}

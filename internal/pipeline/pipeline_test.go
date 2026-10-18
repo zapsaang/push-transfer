@@ -693,3 +693,43 @@ func TestPipeline_AppNotification_CaptchaAndEmergencyEnrichment(t *testing.T) {
 		t.Fatal("expected Emergency=true, got false")
 	}
 }
+
+func TestPipeline_DebugLogging(t *testing.T) {
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	rules := config.RulesConfig{
+		FilterWhite: []string{`(?i)whitelist`},
+		Captcha:     []string{`code:\s*(\d{4})`},
+		Emergency:   []string{`urgent`},
+	}
+	p, err := NewPipelineFromRules(rules, 100*time.Millisecond, logger)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	msg := &model.Message{
+		MsgType: model.MsgTypeText,
+		Title:   "DebugMsg",
+		Content: "whitelist urgent code: 1234",
+	}
+
+	pass, err := p.Process(msg)
+	if err != nil || !pass {
+		t.Fatalf("expected message to pass, got pass=%v, err=%v", pass, err)
+	}
+
+	logs := buf.String()
+	expectedSubstrings := []string{
+		"pipeline: message passed filter stage",
+		"pipeline: captcha extracted",
+		"code=1234",
+		"pipeline: emergency marked",
+		"pipeline: message processing complete",
+	}
+	for _, substr := range expectedSubstrings {
+		if !strings.Contains(logs, substr) {
+			t.Errorf("expected logs to contain %q, got:\n%s", substr, logs)
+		}
+	}
+}
