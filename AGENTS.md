@@ -54,6 +54,7 @@ flowchart TD
 | `internal/ingress/webhook/` | HTTP Webhook 输入端。提供 `/webhook` 与 `/healthz`，实现 1MB 请求体上限 (`http.MaxBytesReader` 防 OOM DoS 返回 `413`)、`LOG_LEVEL=debug` 下记录请求原始 JSON 与解析后的实体字段、认证失败阶段诊断（恒定时间比较且凭据本体永不泄露）、`msg_type` 合法性强制门禁校验（非法/缺失直接 Fail-Fast 返回 `400`）、`IdempotencyChecker` 局部接口解耦接入与重复请求短路返回 HTTP 200 `{"status":"success"}`（审计日志记录）、可信代理边界真实 IP 提取 (`GetRealIP` 仅信任 Loopback/Private 或 `TrustedProxies` 并校验 IP 格式)、多凭据 Bearer Token + HTTP Basic Auth 恒定时间鉴权（SHA-256 预计算摘要 + 每请求固定 3 次哈希 + 全量扫描整数位运算汇聚，`crypto/subtle`）、`401` 时按 RFC 9110 返回 `WWW-Authenticate: Basic` 质询、`X-Forwarded-For` 自右向左跳过受信代理取首个非受信地址，与标准状态码响应。 | 标准库 `net/http`, `crypto/subtle` |
 | `internal/ingress/imap/` | IMAP 邮件触发输入端。基于 `go-imap/v2` 实现长连接 IDLE 与 TLS 拨号超时控制、自定义邮箱目录 (`EMAIL_TRIGGER_MAILBOX`)、至少一次消费语义（Handler 失败保留 `UNSEEN` 并通过会话内非断连指数退避定时器重试）、毒丸死信隔离（损坏 JSON 标记 `\Seen` 防阻塞，但**主题不匹配的普通邮件一律保持原样、绝不改写未读状态**并在 debug 日志记录主题）、触发邮件解析结果 debug 诊断、成功会话后重连退避计数归零与 RFC 2047 MIME 多段安全解码。 | `github.com/emersion/go-imap/v2` |
 | `internal/crypto/` | 安全加密底层。提供 Bark AES-128-CBC 每消息随机 IV 加密（返回 `BarkPayload{Ciphertext, IV}`，对应 Bark 的 `ciphertext`/`iv` 两个独立顶层参数）、16 字符 ASCII IV 生成、以及常量时间校验的 PKCS#7 填充/去填充。 | `crypto/aes`, `crypto/cipher` |
+| `test/e2e/` | 端到端黑盒与系统集成测试套件。独立编译二进制子进程，利用内存动态 TLS CA/证书生成与注入提供 Mock Bark、Telegram、真实 TLS SMTP 与真实 TLS IMAP 服务端，测试全渠道投递闭环、多凭据鉴权、优雅停机、毒丸死信隔离与混合流量高并发压测（`TestE2E_HighConcurrency_Stress_Report`）。 | 标准库 `net/http`, `crypto/x509`, `syscall` |
 
 ---
 
@@ -118,15 +119,18 @@ golangci-lint run ./...   # 配置为 v2 格式；同时校验 gofmt（formatter
 gofmt -l .                # 必须无输出
 go vet ./...              # 必须无输出
 
-# 3. 运行全量单元测试、并发竞态检测 (-race) 与覆盖率统计
+# 3. 运行全量单元测试、端到端测试与并发竞态检测 (-race)
 go test -race -cover ./...
+
+# 4. 运行全模块微基准性能测试
+go test -bench=. -benchtime=10ms -run=^$ ./internal/...
 ```
 
 #### CI 与镜像发布流水线
 
-- **单元测试与静态检查**：由 GitHub Actions 在每次 push 与 pull request 时自动执行，
+- **自动化测试与静态检查**：由 GitHub Actions 在每次 push 与 pull request 时自动执行，
   流水线定义见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，包含 gofmt/vet
-  校验、`go test -race -cover` 与 `golangci-lint run`。**本地验证通过不等于 CI 通过**，
+  校验、单元与端到端测试 `go test -race -cover`、性能基准冒烟测试及 `golangci-lint run`。**本地验证通过不等于 CI 通过**，
   合并前必须以 CI 绿色为准。
 - **容器镜像发布**：由 GitHub Actions 在推送版本 Tag（`v*` 或 `[0-9]*`）时自动触发，
   流水线定义见 [`.github/workflows/release-image.yml`](.github/workflows/release-image.yml)。

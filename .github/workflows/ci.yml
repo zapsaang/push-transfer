@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   test:
-    name: 单元测试 (go test -race)
+    name: 自动化测试 (单元、E2E与基准测试)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -47,8 +47,11 @@ jobs:
       - name: 编译检查
         run: go build -trimpath ./...
 
-      - name: 单元测试 (并发竞态检测 + 覆盖率)
+      - name: 单元与端到端测试 (并发竞态检测 + 覆盖率)
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: 性能基准测试校验 (Benchmark Smoke Test)
+        run: go test -bench=. -benchtime=10ms -run=^$ ./internal/...
 
       - name: 汇总覆盖率
         run: go tool cover -func=coverage.out | tail -n 1
