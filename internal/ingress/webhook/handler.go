@@ -26,18 +26,24 @@ type Deliverer interface {
 	Deliver(ctx context.Context, msg *model.Message) error
 }
 
+// IdempotencyChecker checks and records idempotency keys to suppress duplicate requests.
+type IdempotencyChecker interface {
+	CheckAndRecord(key string) bool
+}
+
 // DefaultMaxBodyBytes is the default maximum webhook request body size (1MB).
 const DefaultMaxBodyBytes int64 = 1 << 20
 
 // HandlerOptions configures the Webhook Handler.
 type HandlerOptions struct {
-	Credentials    []config.Credential
-	MaxBodyBytes   int64
-	TrustedProxies []string
-	Processor      Processor
-	Deliverer      Deliverer
-	TimeLocation   *time.Location
-	Logger         *slog.Logger
+	Credentials        []config.Credential
+	MaxBodyBytes       int64
+	TrustedProxies     []string
+	Processor          Processor
+	Deliverer          Deliverer
+	IdempotencyChecker IdempotencyChecker
+	TimeLocation       *time.Location
+	Logger             *slog.Logger
 }
 
 // Handler handles incoming Webhook HTTP requests.
@@ -47,6 +53,7 @@ type Handler struct {
 	trustedProxies []*net.IPNet
 	processor      Processor
 	deliverer      Deliverer
+	idempotency    IdempotencyChecker
 	timeLocation   *time.Location
 	logger         *slog.Logger
 }
@@ -76,6 +83,7 @@ func NewHandler(opts HandlerOptions) *Handler {
 		trustedProxies: parseTrustedProxies(opts.TrustedProxies, logger),
 		processor:      opts.Processor,
 		deliverer:      opts.Deliverer,
+		idempotency:    opts.IdempotencyChecker,
 		timeLocation:   opts.TimeLocation,
 		logger:         logger,
 	}
@@ -320,6 +328,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"message": "invalid or missing msg_type",
 		})
 		return
+	}
+
+	// Idempotency check: suppress duplicate requests
+	if h.idempotency != nil && msg.IdempotencyKey != "" {
+		if !h.idempotency.CheckAndRecord(msg.IdempotencyKey) {
+			h.logger.Info("webhook message ignored due to duplicate idempotency key",
+				"ip", clientIP,
+				"idempotency_key", msg.IdempotencyKey,
+				"title", msg.Title,
+			)
+			writeJSON(w, http.StatusOK, map[string]string{
+				"status": "success",
+			})
+			return
+		}
 	}
 
 	h.logger.Debug("webhook message parsed",

@@ -168,21 +168,22 @@ func (m MsgType) Valid() bool {
 
 // Message represents the standard data transfer object across push-transfer.
 type Message struct {
-	MsgType       MsgType           `json:"msg_type"`
-	AppName       string            `json:"app_name,omitempty"`
-	Title         string            `json:"title"`
-	Content       string            `json:"content"`
-	Hostname      string            `json:"hostname,omitempty"`
-	BatteryLevel  *int              `json:"battery_level,omitempty"`
-	Timestamp     FlexibleTimestamp `json:"timestamp,omitempty"`
-	SendTime      FlexibleTimestamp `json:"send_time,omitempty"`
-	ReceiveTime   FlexibleTimestamp `json:"receive_time,omitempty"`
-	TransmitTime  FlexibleTimestamp `json:"transmit_time,omitempty"`
-	IncomingTime  FlexibleTimestamp `json:"incoming_time,omitempty"`
-	TimeSensitive bool              `json:"time_sensitive,omitempty"`
-	Emergency     bool              `json:"emergency,omitempty"`
-	CaptchaCode   string            `json:"captcha_code,omitempty"`
-	timeLocation  *time.Location
+	MsgType        MsgType           `json:"msg_type"`
+	AppName        string            `json:"app_name,omitempty"`
+	Title          string            `json:"title"`
+	Content        string            `json:"content"`
+	Hostname       string            `json:"hostname,omitempty"`
+	BatteryLevel   *int              `json:"battery_level,omitempty"`
+	Timestamp      FlexibleTimestamp `json:"timestamp,omitempty"`
+	SendTime       FlexibleTimestamp `json:"send_time,omitempty"`
+	ReceiveTime    FlexibleTimestamp `json:"receive_time,omitempty"`
+	TransmitTime   FlexibleTimestamp `json:"transmit_time,omitempty"`
+	IncomingTime   FlexibleTimestamp `json:"incoming_time,omitempty"`
+	TimeSensitive  bool              `json:"time_sensitive,omitempty"`
+	Emergency      bool              `json:"emergency,omitempty"`
+	CaptchaCode    string            `json:"captcha_code,omitempty"`
+	IdempotencyKey string            `json:"idempotency_key,omitempty"` // 幂等去重键
+	timeLocation   *time.Location
 }
 
 func parseBatteryLevel(raw []byte) *int {
@@ -330,6 +331,8 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	*m = Message(raw.Alias)
+
+	m.IdempotencyKey = truncateRunes(strings.TrimSpace(m.IdempotencyKey), 256)
 
 	if len(raw.BatteryLevel) > 0 {
 		m.BatteryLevel = parseBatteryLevel(raw.BatteryLevel)
@@ -508,4 +511,18 @@ func sanitizeSingleLine(s string) string {
 		return r
 	}, s)
 	return strings.TrimSpace(s)
+}
+
+func truncateRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	if len(s) <= maxRunes {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes])
 }

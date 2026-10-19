@@ -84,6 +84,10 @@ flowchart TD
 - **高可靠 IMAP 邮件触发**：
   - 优先使用 IMAP IDLE 长连接接收新邮件，兼容无 IDLE 支持的服务商自动降级轮询。
   - 具备指数退避重试、毒丸邮件（Poison Pill）死信隔离与至少一次（At-Least-Once）消费保障。
+- **跨输入源请求幂等与去重 (Idempotency)**：
+  - 跨 Webhook 与 IMAP 输入源共享并发安全内存去重缓存（`internal/idempotency.MemoryCache`），消息载荷支持可选字段 `idempotency_key`（自动剥离首尾空白并以 256 Rune 安全截断）。
+  - 基于原子 Check-and-Set、惰性与周期双轨淘汰机制，并在低存活率时自动触发 Map 紧缩（Compaction）重建回收哈希桶底层内存。
+  - 判定重复时统一实行优雅忽略语义：Webhook 直接短路并返回 HTTP 200 `{"status":"success"}` 附带审计日志，防止客户端重试轰炸；IMAP 邮件触发器安全跳过策略与投递并标记已读 `\Seen`，防止死循环拉取消费。
 - **优雅退出 (Graceful Shutdown)**：对称纳管 HTTP 服务与后台 IMAP 协程生命周期，收到系统中断信号（SIGINT/SIGTERM）后平滑释放资源与连接。
 
 ---
@@ -341,6 +345,12 @@ PushTransfer 遵循 **12-Factor 原则**，所有配置均通过环境变量进�
 | `REGEX_CAPTCHA` | `[]` | 验证码提取正则列表（**JSON 字符串数组**）。优先提取第 1 捕获组 |
 | `REGEX_EMERGENCY` | `[]` | 紧急通知识别正则列表（**JSON 字符串数组**）。命中则 Bark 设为 critical 强提醒 |
 
+#### 8. 请求幂等与去重 (Idempotency)
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `IDEMPOTENCY_TTL` | `60s` | 幂等缓存过期时间。有效区间 `[1s, 24h]`，超出区间启动报错。支持纯数字秒数（如 `60`、`86400`）或标准时长串（如 `1s`、`2m`、`24h`）。在 TTL 时间窗内相同的 `idempotency_key` 将被判定为重复并短路忽略 |
+| `IDEMPOTENCY_MAX_KEYS` | `10000` | 内存去重缓存容量上限，**必须为正整数**（`> 0`），非正整数或非法格式启动报错。达到上限且有新 Key 写入时以常数时间淘汰旧项，防止无界内存膨胀与 OOM |
+
 ---
 
 ### 正则规则配置指南 (JSON 数组)
@@ -405,6 +415,7 @@ Authorization: Bearer <你的 token>   # AUTH_CREDENTIALS 中某个条目的 tok
   "hostname": "Pixel-8",
   "battery_level": "85%",
   "time_sensitive": true,
+  "idempotency_key": "req-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
   "timestamp": "2026-10-18T00:15:20+08:00",
   "send_time": 1729000000,
   "receive_time": 1729000005
@@ -422,6 +433,7 @@ Authorization: Bearer <你的 token>   # AUTH_CREDENTIALS 中某个条目的 tok
 | `hostname` | string | 否 | 发送端设备主机名/标识（如 `"Pixel-8"`）。在 Telegram、Email 正文末尾及 Console 结构化日志/文本中展示（`设备主机名: ...`）；Bark 显式不携带以保持横幅精简 |
 | `battery_level` | int/str | 否 | 发送端设备当前剩余电量百分比。自适应兼容数值（`85`、`0`）、带百分号或浮点字符串（`"85%"`、`"85.0"`、`" 85 % "`）；空串或非法值安全降级为 `nil`（不误显电量行） |
 | `time_sensitive` | bool/str/int | 否 | 时效性通知标记。自适应兼容原生布尔值（`true`/`false`）、数值（`1`/`0`、`1.0`/`0.0`）、英文字符串（`"true"`/`"false"`、`"1"`/`"0"`、`"yes"`/`"no"`、`"y"`/`"n"`、`"on"`/`"off"`、`"enable"`/`"disable"`）及本地化中文字符串（`"是"`/`"否"`、`"真"`/`"假"`、`"对"`/`"错"`）；非法值安全降级为 `false`。为 `true` 时 Bark `level` 设置为 `timeSensitive`（iOS 突破专注模式但不破物理静音；若同时为 `emergency` 则紧急优先保持 `critical` 强警报）。若正文命中验证码提取规则，系统自动富化为 `true` |
+| `idempotency_key` | string | 否 | 请求幂等去重键。自动剥离首尾空白并通过 256 Rune 安全截断。在 `IDEMPOTENCY_TTL` 窗口期内相同的 key 将被原子拦截，短路返回 HTTP 200 `{"status":"success"}` 并输出审计日志，防止重发引发下游多渠道重复推送。空值或缺失则恒放行 |
 | `timestamp` | int/str | 否 | 通用时间戳。系统具备防御性容错，自动兼容秒（10位）、毫秒（13位）、字符串数字、ISO 8601 格式化日期字符串（支持显式时区、无时区本地时间、逗号小数秒与 Unicode 转义）及 RFC 5322 / RFC 2822 邮件格式日期字符串；输入携带显式时区（如 `+08:00`）时排版自动优先继承该时区展示（防止受服务器/容器默认 UTC 零时区影响）；非法值静默降级为 `0` |
 | `send_time` | int/str | 否 | 消息实际发送时间戳（备选回退字段，享受与 `timestamp` 相同的多格式解析与容错能力） |
 | `receive_time` | int/str | 否 | 转发端设备接收时间戳（备选回退字段，享受与 `timestamp` 相同的多格式解析与容错能力） |
@@ -432,7 +444,7 @@ Authorization: Bearer <你的 token>   # AUTH_CREDENTIALS 中某个条目的 tok
 
 | HTTP Code | 响应体示例 | 场景说明 |
 |-----------|------------|----------|
-| `200 OK` | `{"status":"success"}` | 消息处理并通过流水线，已成功投递下游 |
+| `200 OK` | `{"status":"success"}` | 消息处理并通过流水线，已成功投递下游；或命中重复的 `idempotency_key` 执行优雅短路忽略（幂等成功，防止重试轰炸） |
 | `200 OK` | `{"status":"blocked"}` | 消息命中黑名单规则，已被网关正常拦截过滤 |
 | `400 Bad Request` | `{"status":"failed","message":"invalid or missing msg_type"}` | 消息类型缺失、为空或未定义（严格 Fail-Fast，杜绝隐式默认） |
 | `400 Bad Request` | `{"status":"failed","message":"invalid json"}` | 报文不是合法的 JSON 格式 |

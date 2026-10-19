@@ -177,6 +177,12 @@ func (m RunMode) StartsIMAP() bool {
 	return m == RunModeIMAP || m == RunModeBoth
 }
 
+// IdempotencyConfig contains configuration for message deduplication.
+type IdempotencyConfig struct {
+	TTL     time.Duration
+	MaxKeys int
+}
+
 // Config represents the application configuration tree.
 // Optional channel configurations are nil when unconfigured.
 type Config struct {
@@ -188,6 +194,7 @@ type Config struct {
 	IMAP         *IMAPConfig
 	Crypto       *CryptoConfig
 	Rules        RulesConfig
+	Idempotency  IdempotencyConfig
 	RunMode      RunMode
 	LogLevel     slog.Level
 	Timezone     string
@@ -406,6 +413,20 @@ func LoadFromLookup(lookup func(string) string) (*Config, error) {
 		FilterWhite: whiteRules,
 		Captcha:     captchaRules,
 		Emergency:   emergencyRules,
+	}
+
+	// 8. Idempotency Config
+	idempotencyTTL, err := parseIdempotencyTTL(lookup("IDEMPOTENCY_TTL"))
+	if err != nil {
+		return nil, err
+	}
+	idempotencyMaxKeys, err := parseIdempotencyMaxKeys(lookup("IDEMPOTENCY_MAX_KEYS"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.Idempotency = IdempotencyConfig{
+		TTL:     idempotencyTTL,
+		MaxKeys: idempotencyMaxKeys,
 	}
 
 	return cfg, nil
@@ -684,4 +705,40 @@ func parseCredentials(raw string) ([]Credential, error) {
 	}
 
 	return creds, nil
+}
+
+func parseIdempotencyTTL(val string) (time.Duration, error) {
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" {
+		return 60 * time.Second, nil
+	}
+	if sec, err := strconv.Atoi(trimmed); err == nil {
+		if sec < 1 || sec > 86400 {
+			return 0, fmt.Errorf("environment variable IDEMPOTENCY_TTL must be between 1s and 24h, got: %q", val)
+		}
+		return time.Duration(sec) * time.Second, nil
+	}
+	d, err := time.ParseDuration(trimmed)
+	if err != nil {
+		return 0, fmt.Errorf("environment variable IDEMPOTENCY_TTL must be a valid duration, got: %q: %w", val, err)
+	}
+	if d < 1*time.Second || d > 24*time.Hour {
+		return 0, fmt.Errorf("environment variable IDEMPOTENCY_TTL must be between 1s and 24h, got: %q", val)
+	}
+	return d, nil
+}
+
+func parseIdempotencyMaxKeys(val string) (int, error) {
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" {
+		return 10000, nil
+	}
+	n, err := strconv.Atoi(trimmed)
+	if err != nil {
+		return 0, fmt.Errorf("environment variable IDEMPOTENCY_MAX_KEYS must be a positive integer, got: %q: %w", val, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("environment variable IDEMPOTENCY_MAX_KEYS must be greater than 0, got: %d", n)
+	}
+	return n, nil
 }

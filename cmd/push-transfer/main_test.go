@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/zapsaang/push-transfer/internal/config"
+	"github.com/zapsaang/push-transfer/internal/idempotency"
+	"github.com/zapsaang/push-transfer/internal/ingress/webhook"
 	"github.com/zapsaang/push-transfer/internal/model"
 )
 
@@ -1704,4 +1706,391 @@ func TestRun_InvalidTimezone_FailFast(t *testing.T) {
 	if !strings.Contains(err.Error(), "TIMEZONE") {
 		t.Errorf("expected error to mention TIMEZONE, got: %v", err)
 	}
+}
+
+type testDelivererCapture struct {
+	mu       sync.Mutex
+	messages []*model.Message
+}
+
+func (d *testDelivererCapture) Deliver(_ context.Context, msg *model.Message) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.messages = append(d.messages, msg.Clone())
+	return nil
+}
+
+func (d *testDelivererCapture) Count() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.messages)
+}
+
+type testPassthroughProcessor struct{}
+
+func (p *testPassthroughProcessor) Process(_ *model.Message) (bool, error) {
+	return true, nil
+}
+
+func TestCrossSource_Idempotency_E2E(t *testing.T) {
+	t.Run("1. Webhook first then IMAP suppresses duplicate", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+		// Shared idempotency cache
+		sharedCache := idempotency.NewMemoryCache(ctx, 60*time.Second, 1000)
+		defer sharedCache.Close()
+
+		dispatcher := &testDelivererCapture{}
+		pipe := &testPassthroughProcessor{}
+
+		token := "cross-channel-token"
+		whHandler := webhook.NewHandler(webhook.HandlerOptions{
+			Credentials:        []config.Credential{{Token: token}},
+			Processor:          pipe,
+			Deliverer:          dispatcher,
+			IdempotencyChecker: sharedCache,
+			Logger:             logger,
+		})
+
+		imapH := newIMAPHandler(pipe, dispatcher, sharedCache, logger)
+
+		// 1. Webhook receives message with key "tx-100"
+		whBody := `{"msg_type":"text","title":"SMS 1","content":"Webhook first","idempotency_key":"tx-100"}`
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(whBody))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		whHandler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("webhook expected 200 OK, got %d; body: %s", rec.Code, rec.Body.String())
+		}
+		if dispatcher.Count() != 1 {
+			t.Fatalf("expected dispatcher called 1 time after webhook, got %d", dispatcher.Count())
+		}
+
+		// 2. IMAP receives message with identical key "tx-100"
+		imapMsg := &model.Message{
+			MsgType:        model.MsgTypeText,
+			Title:          "IMAP Duplicate",
+			Content:        "IMAP content with same key",
+			IdempotencyKey: "tx-100",
+		}
+		if err := imapH(ctx, imapMsg); err != nil {
+			t.Fatalf("expected imapHandler to return nil, got: %v", err)
+		}
+
+		// Dispatcher count MUST stay 1
+		if dispatcher.Count() != 1 {
+			t.Fatalf("expected dispatcher count to stay 1, got %d", dispatcher.Count())
+		}
+
+		// Verify audit log has imap duplicate message
+		logs := logBuf.String()
+		if !strings.Contains(logs, "imap message ignored due to duplicate idempotency key") {
+			t.Fatalf("expected IMAP duplicate ignore audit log, got:\n%s", logs)
+		}
+	})
+
+	t.Run("2. IMAP first then Webhook suppresses duplicate", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+		sharedCache := idempotency.NewMemoryCache(ctx, 60*time.Second, 1000)
+		defer sharedCache.Close()
+
+		dispatcher := &testDelivererCapture{}
+		pipe := &testPassthroughProcessor{}
+
+		token := "cross-channel-token-2"
+		whHandler := webhook.NewHandler(webhook.HandlerOptions{
+			Credentials:        []config.Credential{{Token: token}},
+			Processor:          pipe,
+			Deliverer:          dispatcher,
+			IdempotencyChecker: sharedCache,
+			Logger:             logger,
+		})
+
+		imapH := newIMAPHandler(pipe, dispatcher, sharedCache, logger)
+
+		// 1. IMAP receives first with key "tx-200"
+		imapMsg := &model.Message{
+			MsgType:        model.MsgTypeText,
+			Title:          "IMAP First",
+			Content:        "IMAP content first",
+			IdempotencyKey: "tx-200",
+		}
+		if err := imapH(ctx, imapMsg); err != nil {
+			t.Fatalf("expected imapHandler to return nil on first consume, got: %v", err)
+		}
+		if dispatcher.Count() != 1 {
+			t.Fatalf("expected dispatcher called 1 time after IMAP, got %d", dispatcher.Count())
+		}
+
+		// 2. Webhook receives duplicate with key "tx-200"
+		whBody := `{"msg_type":"text","title":"SMS 2","content":"Webhook duplicate","idempotency_key":"tx-200"}`
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(whBody))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		whHandler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("webhook expected 200 OK, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), `"status":"success"`) {
+			t.Fatalf("expected status success in response, got %s", rec.Body.String())
+		}
+		// Dispatcher count MUST stay 1
+		if dispatcher.Count() != 1 {
+			t.Fatalf("expected dispatcher count to stay 1, got %d", dispatcher.Count())
+		}
+
+		// Verify audit log has webhook duplicate message
+		logs := logBuf.String()
+		if !strings.Contains(logs, "webhook message ignored due to duplicate idempotency key") {
+			t.Fatalf("expected Webhook duplicate ignore audit log, got:\n%s", logs)
+		}
+	})
+
+	t.Run("3. Idempotency configuration takes effect in run", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		// Cancel immediately so run exits after startup
+		cancel()
+
+		var buf bytes.Buffer
+		env := map[string]string{
+			"RUN_MODE":             "webhook",
+			"AUTH_CREDENTIALS":     `[{"name":"test","token":"valid-token"}]`,
+			"IDEMPOTENCY_TTL":      "120s",
+			"IDEMPOTENCY_MAX_KEYS": "5000",
+			"PORT":                 "0",
+		}
+
+		err := run(ctx, nil, &buf, func(k string) string { return env[k] })
+		if err != nil {
+			t.Fatalf("run failed: %v", err)
+		}
+
+		// Load config directly to verify custom params
+		cfg, err := config.LoadFromLookup(func(k string) string { return env[k] })
+		if err != nil {
+			t.Fatalf("config load failed: %v", err)
+		}
+		if cfg.Idempotency.TTL != 120*time.Second {
+			t.Errorf("expected TTL 120s, got %v", cfg.Idempotency.TTL)
+		}
+		if cfg.Idempotency.MaxKeys != 5000 {
+			t.Errorf("expected MaxKeys 5000, got %d", cfg.Idempotency.MaxKeys)
+		}
+	})
+
+	t.Run("4. Empty key on both Webhook and IMAP allows both deliveries", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		sharedCache := idempotency.NewMemoryCache(ctx, 60*time.Second, 1000)
+		defer sharedCache.Close()
+
+		dispatcher := &testDelivererCapture{}
+		pipe := &testPassthroughProcessor{}
+
+		token := "empty-key-token"
+		whHandler := webhook.NewHandler(webhook.HandlerOptions{
+			Credentials:        []config.Credential{{Token: token}},
+			Processor:          pipe,
+			Deliverer:          dispatcher,
+			IdempotencyChecker: sharedCache,
+		})
+
+		imapH := newIMAPHandler(pipe, dispatcher, sharedCache, nil)
+
+		// 1. Webhook without idempotency_key
+		whBody := `{"msg_type":"text","title":"SMS No Key","content":"Webhook empty key"}`
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(whBody))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		whHandler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("webhook expected 200 OK, got %d", rec.Code)
+		}
+		if dispatcher.Count() != 1 {
+			t.Fatalf("expected dispatcher called 1 time, got %d", dispatcher.Count())
+		}
+
+		// 2. IMAP without idempotency_key
+		imapMsg := &model.Message{
+			MsgType: model.MsgTypeText,
+			Title:   "IMAP No Key",
+			Content: "IMAP empty key",
+		}
+		if err := imapH(ctx, imapMsg); err != nil {
+			t.Fatalf("expected imapHandler to succeed, got: %v", err)
+		}
+
+		if dispatcher.Count() != 2 {
+			t.Fatalf("expected dispatcher count to be 2 for empty keys, got %d", dispatcher.Count())
+		}
+	})
+
+	t.Run("5. Concurrent Webhook and IMAP racing same key allows strictly 1 delivery", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		sharedCache := idempotency.NewMemoryCache(ctx, 60*time.Second, 1000)
+		defer sharedCache.Close()
+
+		dispatcher := &testDelivererCapture{}
+		pipe := &testPassthroughProcessor{}
+
+		token := "concurrent-race-token"
+		whHandler := webhook.NewHandler(webhook.HandlerOptions{
+			Credentials:        []config.Credential{{Token: token}},
+			Processor:          pipe,
+			Deliverer:          dispatcher,
+			IdempotencyChecker: sharedCache,
+		})
+
+		imapH := newIMAPHandler(pipe, dispatcher, sharedCache, nil)
+
+		var wg sync.WaitGroup
+		startCh := make(chan struct{})
+
+		sharedRaceKey := "race-key-42"
+
+		// 20 Webhook workers
+		for i := 0; i < 20; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-startCh
+				whBody := fmt.Sprintf(`{"msg_type":"text","title":"WH Race","content":"WH","idempotency_key":%q}`, sharedRaceKey)
+				req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(whBody))
+				req.Header.Set("Authorization", "Bearer "+token)
+				rec := httptest.NewRecorder()
+				whHandler.ServeHTTP(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Errorf("webhook unexpected status %d", rec.Code)
+				}
+			}()
+		}
+
+		// 20 IMAP workers
+		for i := 0; i < 20; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-startCh
+				imapMsg := &model.Message{
+					MsgType:        model.MsgTypeText,
+					Title:          "IMAP Race",
+					Content:        "IMAP",
+					IdempotencyKey: sharedRaceKey,
+				}
+				if err := imapH(ctx, imapMsg); err != nil {
+					t.Errorf("imapHandler unexpected error: %v", err)
+				}
+			}()
+		}
+
+		// All 40 workers start concurrently
+		close(startCh)
+		wg.Wait()
+
+		// Under race detector, exactly 1 delivery must succeed across both sources
+		if dispatcher.Count() != 1 {
+			t.Fatalf("expected strictly 1 delivery across 40 concurrent cross-source calls, got %d", dispatcher.Count())
+		}
+	})
+}
+
+type testCustomProcessor struct {
+	fn func(*model.Message) (bool, error)
+}
+
+func (p *testCustomProcessor) Process(msg *model.Message) (bool, error) {
+	return p.fn(msg)
+}
+
+func TestNewIMAPHandler_NilLoggerDefensive(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("first deliver and duplicate suppression without panic", func(t *testing.T) {
+		pipe := &testPassthroughProcessor{}
+		dispatcher := &testDelivererCapture{}
+		cache := &idempotency.MemoryCache{}
+		defer cache.Close()
+
+		handler := newIMAPHandler(pipe, dispatcher, cache, nil)
+
+		msg := &model.Message{
+			MsgType:        model.MsgTypeText,
+			Title:          "Nil Logger Test",
+			Content:        "content",
+			IdempotencyKey: "nil-logger-1",
+		}
+		if err := handler(ctx, msg); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if dispatcher.Count() != 1 {
+			t.Fatalf("expected 1 delivered message, got %d", dispatcher.Count())
+		}
+
+		// 重复消息触发 logger.Info 审计日志
+		if err := handler(ctx, msg); err != nil {
+			t.Fatalf("unexpected error on duplicate: %v", err)
+		}
+		if dispatcher.Count() != 1 {
+			t.Fatalf("expected count to stay 1, got %d", dispatcher.Count())
+		}
+	})
+
+	t.Run("filter rejection logs without panic", func(t *testing.T) {
+		pipe := &testCustomProcessor{
+			fn: func(_ *model.Message) (bool, error) {
+				return false, nil
+			},
+		}
+		dispatcher := &testDelivererCapture{}
+		handler := newIMAPHandler(pipe, dispatcher, nil, nil)
+
+		msg := &model.Message{
+			MsgType: model.MsgTypeText,
+			Title:   "Filtered Title",
+			Content: "filtered content",
+		}
+		if err := handler(ctx, msg); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if dispatcher.Count() != 0 {
+			t.Fatalf("expected 0 delivered messages, got %d", dispatcher.Count())
+		}
+	})
+
+	t.Run("pipeline error logs without panic", func(t *testing.T) {
+		pipeErr := errors.New("pipeline broken")
+		pipe := &testCustomProcessor{
+			fn: func(_ *model.Message) (bool, error) {
+				return false, pipeErr
+			},
+		}
+		dispatcher := &testDelivererCapture{}
+		handler := newIMAPHandler(pipe, dispatcher, nil, nil)
+
+		msg := &model.Message{
+			MsgType: model.MsgTypeText,
+			Title:   "Error Title",
+			Content: "error content",
+		}
+		err := handler(ctx, msg)
+		if !errors.Is(err, pipeErr) {
+			t.Fatalf("expected pipeline error %v, got %v", pipeErr, err)
+		}
+	})
 }

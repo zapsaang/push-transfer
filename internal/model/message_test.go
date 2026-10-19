@@ -1498,3 +1498,149 @@ func TestMessage_GenComplexText_InheritsInputTimezone(t *testing.T) {
 		t.Fatalf("expected complexText to inherit input timezone and show '18:36:44', but got:\n%s", complexText)
 	}
 }
+
+func TestMessage_IdempotencyKey_Parsing(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"normal string", `{"idempotency_key": "abc-123"}`, "abc-123"},
+		{"trim whitespace", `{"idempotency_key": "  \t  key-with-spaces \n "}`, "key-with-spaces"},
+		{"null value", `{"idempotency_key": null}`, ""},
+		{"omitted field", `{"title": "hello"}`, ""},
+		{"empty string", `{"idempotency_key": ""}`, ""},
+		{"only whitespace", `{"idempotency_key": "   \n\t  "}`, ""},
+		{"null character inside string", "{\"idempotency_key\": \"key\\u0000with\\u0000null\"}", "key\x00with\x00null"},
+		{"multibyte characters chinese japanese arabic", `{"idempotency_key": "  订单-番号-123-日本語-عربي  "}`, "订单-番号-123-日本語-عربي"},
+		{"special symbols and punctuation", `{"idempotency_key": "  !@#$%^&*()_+-=[]{}|;':,./<>?` + "`" + `~  "}`, "!@#$%^&*()_+-=[]{}|;':,./<>?`~"},
+		{"emojis and symbols", `{"idempotency_key": "  🔥🔔🚀✅🎯  "}`, "🔥🔔🚀✅🎯"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var msg Message
+			if err := json.Unmarshal([]byte(tc.input), &msg); err != nil {
+				t.Fatalf("unexpected unmarshal error: %v", err)
+			}
+			if msg.IdempotencyKey != tc.expected {
+				t.Errorf("expected IdempotencyKey %q, got %q", tc.expected, msg.IdempotencyKey)
+			}
+		})
+	}
+}
+
+func TestMessage_IdempotencyKey_UnicodeTruncate(t *testing.T) {
+	// Construct a string with 300 runes: 150 Chinese chars + 150 emojis
+	chinesePart := strings.Repeat("中", 150)
+	emojiPart := strings.Repeat("🚀", 150)
+	fullStr := chinesePart + emojiPart // 300 runes
+
+	expectedRunes := []rune(fullStr)[:256]
+	expected := string(expectedRunes)
+
+	inputJSON, err := json.Marshal(map[string]string{
+		"idempotency_key": fullStr,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal JSON: %v", err)
+	}
+
+	var msg Message
+	if err := json.Unmarshal(inputJSON, &msg); err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+
+	if len([]rune(msg.IdempotencyKey)) != 256 {
+		t.Fatalf("expected exactly 256 runes, got %d", len([]rune(msg.IdempotencyKey)))
+	}
+	if msg.IdempotencyKey != expected {
+		t.Fatalf("expected truncated string to match expected 256 runes")
+	}
+
+	// Boundary check: exactly 256 runes should not be truncated
+	input256, err := json.Marshal(map[string]string{
+		"idempotency_key": expected,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal JSON: %v", err)
+	}
+	var msg256 Message
+	if err := json.Unmarshal(input256, &msg256); err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+	if msg256.IdempotencyKey != expected {
+		t.Fatalf("expected exact 256 runes preserved without change")
+	}
+
+	// Mixed 1-byte, 2-byte, 3-byte, and 4-byte runes truncation
+	// 'a' (1-byte), 'ж' (2-byte), '测' (3-byte), '🎉' (4-byte) = 4 runes per block
+	var mixedBuilder strings.Builder
+	for i := 0; i < 70; i++ { // 70 * 4 = 280 runes
+		mixedBuilder.WriteString("aж测🎉")
+	}
+	mixedStr := mixedBuilder.String()
+	expectedMixed := string([]rune(mixedStr)[:256])
+
+	inputMixed, err := json.Marshal(map[string]string{
+		"idempotency_key": mixedStr,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal mixed JSON: %v", err)
+	}
+	var msgMixed Message
+	if err := json.Unmarshal(inputMixed, &msgMixed); err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+	if len([]rune(msgMixed.IdempotencyKey)) != 256 {
+		t.Fatalf("expected 256 runes, got %d", len([]rune(msgMixed.IdempotencyKey)))
+	}
+	if msgMixed.IdempotencyKey != expectedMixed {
+		t.Fatalf("expected mixed truncated string to match rune-safe slice")
+	}
+}
+
+func TestMessage_Clone_PreservesIdempotencyKey(t *testing.T) {
+	orig := &Message{
+		Title:          "Original",
+		IdempotencyKey: "unique-key-12345",
+	}
+
+	cloned := orig.Clone()
+	if cloned == nil {
+		t.Fatal("expected non-nil clone")
+	}
+	if cloned.IdempotencyKey != orig.IdempotencyKey {
+		t.Fatalf("expected cloned IdempotencyKey %q, got %q", orig.IdempotencyKey, cloned.IdempotencyKey)
+	}
+
+	// Mutating cloned must not affect original
+	cloned.IdempotencyKey = "mutated-key"
+	if orig.IdempotencyKey != "unique-key-12345" {
+		t.Fatalf("original IdempotencyKey was mutated, got %q", orig.IdempotencyKey)
+	}
+}
+
+func TestTruncateRunes_BoundaryAndNegative(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    string
+		maxRunes int
+		expected string
+	}{
+		{"negative maxRunes", "hello world", -1, ""},
+		{"zero maxRunes", "hello world", 0, ""},
+		{"empty string negative", "", -5, ""},
+		{"empty string zero", "", 0, ""},
+		{"single rune max 1", "你好世界", 1, "你"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := truncateRunes(tc.input, tc.maxRunes)
+			if res != tc.expected {
+				t.Fatalf("expected truncateRunes(%q, %d) = %q, got %q", tc.input, tc.maxRunes, tc.expected, res)
+			}
+		})
+	}
+}

@@ -18,6 +18,7 @@ import (
 
 	"github.com/zapsaang/push-transfer/internal/config"
 	"github.com/zapsaang/push-transfer/internal/deliver"
+	"github.com/zapsaang/push-transfer/internal/idempotency"
 	"github.com/zapsaang/push-transfer/internal/ingress/imap"
 	"github.com/zapsaang/push-transfer/internal/ingress/webhook"
 	"github.com/zapsaang/push-transfer/internal/model"
@@ -84,6 +85,46 @@ func resolveRunModes(cfg *config.Config) (runModes, error) {
 		return runModes{}, errors.New("environment variable RUN_MODE is required: use one of webhook, imap, both")
 	}
 	return runModes{Webhook: cfg.RunMode.StartsWebhook(), IMAP: cfg.RunMode.StartsIMAP()}, nil
+}
+
+type processor interface {
+	Process(msg *model.Message) (bool, error)
+}
+
+type deliverer interface {
+	Deliver(ctx context.Context, msg *model.Message) error
+}
+
+type idempotencyChecker interface {
+	CheckAndRecord(key string) bool
+}
+
+func newIMAPHandler(pipe processor, dispatcher deliverer, idempotencyChecker idempotencyChecker, logger *slog.Logger) imap.MessageHandler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return func(ctx context.Context, msg *model.Message) error {
+		if idempotencyChecker != nil && msg.IdempotencyKey != "" {
+			if !idempotencyChecker.CheckAndRecord(msg.IdempotencyKey) {
+				logger.Info("imap message ignored due to duplicate idempotency key",
+					"idempotency_key", msg.IdempotencyKey,
+					"title", msg.Title,
+				)
+				return nil
+			}
+		}
+
+		pass, err := pipe.Process(msg)
+		if err != nil {
+			logger.Error("imap message processing error", "error", err, "title", msg.Title)
+			return err
+		}
+		if !pass {
+			logger.Info("imap message rejected by filter", "title", msg.Title)
+			return nil
+		}
+		return dispatcher.Deliver(ctx, msg)
+	}
 }
 
 // run executes the push-transfer service with the provided context, CLI arguments,
@@ -159,22 +200,15 @@ func run(ctx context.Context, args []string, stdout io.Writer, lookup func(strin
 	rootCtx, rootCancel := context.WithCancel(ctx)
 	defer rootCancel()
 
+	// Setup shared idempotency cache
+	idempotencyCache := idempotency.NewMemoryCache(rootCtx, cfg.Idempotency.TTL, cfg.Idempotency.MaxKeys)
+	defer idempotencyCache.Close()
+
 	var wg sync.WaitGroup
 
 	// 7. Start IMAP listener if enabled
 	if modes.IMAP {
-		imapHandler := func(ctx context.Context, msg *model.Message) error {
-			pass, err := pipe.Process(msg)
-			if err != nil {
-				logger.Error("imap message processing error", "error", err, "title", msg.Title)
-				return err
-			}
-			if !pass {
-				logger.Info("imap message rejected by filter", "title", msg.Title)
-				return nil
-			}
-			return dispatcher.Deliver(ctx, msg)
-		}
+		imapHandler := newIMAPHandler(pipe, dispatcher, idempotencyCache, logger)
 
 		imapListener := imap.NewListener(imap.ListenerOptions{
 			IMAPServer:   cfg.IMAP.IMAPServer,
@@ -214,12 +248,13 @@ func run(ctx context.Context, args []string, stdout io.Writer, lookup func(strin
 		logger.Info("configured webhook credentials", "count", len(creds), "names", credNames)
 
 		webhookHandler := webhook.NewHandler(webhook.HandlerOptions{
-			Credentials:    creds,
-			TrustedProxies: cfg.Server.TrustedProxies,
-			Processor:      pipe,
-			Deliverer:      dispatcher,
-			TimeLocation:   cfg.TimeLocation,
-			Logger:         logger,
+			Credentials:        creds,
+			TrustedProxies:     cfg.Server.TrustedProxies,
+			Processor:          pipe,
+			Deliverer:          dispatcher,
+			IdempotencyChecker: idempotencyCache,
+			TimeLocation:       cfg.TimeLocation,
+			Logger:             logger,
 		})
 
 		mux := http.NewServeMux()

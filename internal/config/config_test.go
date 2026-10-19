@@ -1434,3 +1434,127 @@ func TestConfig_Timezone(t *testing.T) {
 		})
 	}
 }
+
+func TestConfig_Idempotency(t *testing.T) {
+	t.Run("default values when unset", func(t *testing.T) {
+		cfg, err := LoadFromLookup(func(string) string { return "" })
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Idempotency.TTL != 60*time.Second {
+			t.Errorf("expected default TTL 60s, got %v", cfg.Idempotency.TTL)
+		}
+		if cfg.Idempotency.MaxKeys != 10000 {
+			t.Errorf("expected default MaxKeys 10000, got %d", cfg.Idempotency.MaxKeys)
+		}
+	})
+
+	t.Run("valid format parsing", func(t *testing.T) {
+		testCases := []struct {
+			name        string
+			ttlStr      string
+			maxKeysStr  string
+			wantTTL     time.Duration
+			wantMaxKeys int
+		}{
+			{"pure number seconds", "30", "5000", 30 * time.Second, 5000},
+			{"standard duration string 2m", "2m", "20000", 2 * time.Minute, 20000},
+			{"duration string 1h", "1h", "100", 1 * time.Hour, 100},
+			{"trimmed whitespace", "  45s  ", "  888  ", 45 * time.Second, 888},
+			{"boundary lower 1s duration", "1s", "100", 1 * time.Second, 100},
+			{"boundary lower 1s pure integer", "1", "100", 1 * time.Second, 100},
+			{"boundary upper 24h duration", "24h", "100", 24 * time.Hour, 100},
+			{"boundary upper 24h pure integer (86400)", "86400", "100", 24 * time.Hour, 100},
+			{"boundary lower max keys 1", "60s", "1", 60 * time.Second, 1},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg, err := LoadFromLookup(func(k string) string {
+					switch k {
+					case "IDEMPOTENCY_TTL":
+						return tc.ttlStr
+					case "IDEMPOTENCY_MAX_KEYS":
+						return tc.maxKeysStr
+					default:
+						return ""
+					}
+				})
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if cfg.Idempotency.TTL != tc.wantTTL {
+					t.Errorf("expected TTL %v, got %v", tc.wantTTL, cfg.Idempotency.TTL)
+				}
+				if cfg.Idempotency.MaxKeys != tc.wantMaxKeys {
+					t.Errorf("expected MaxKeys %d, got %d", tc.wantMaxKeys, cfg.Idempotency.MaxKeys)
+				}
+			})
+		}
+	})
+
+	t.Run("IDEMPOTENCY_TTL validation fail-fast", func(t *testing.T) {
+		invalidCases := []struct {
+			name string
+			val  string
+		}{
+			{"invalid string", "not-a-duration"},
+			{"negative pure number", "-5"},
+			{"negative duration", "-10s"},
+			{"zero seconds", "0"},
+			{"zero duration", "0s"},
+			{"less than 1s duration 500ms", "500ms"},
+			{"less than 1s duration 999ms", "999ms"},
+			{"greater than 24h pure number 86401", "86401"},
+			{"greater than 24h duration 24h1s", "24h1s"},
+			{"greater than 24h duration 24h1m", "24h1m"},
+			{"greater than 24h duration 25h", "25h"},
+		}
+
+		for _, tc := range invalidCases {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := LoadFromLookup(func(k string) string {
+					if k == "IDEMPOTENCY_TTL" {
+						return tc.val
+					}
+					return ""
+				})
+				if err == nil {
+					t.Fatalf("expected error for IDEMPOTENCY_TTL=%q, got nil", tc.val)
+				}
+				if !strings.Contains(err.Error(), "IDEMPOTENCY_TTL") {
+					t.Errorf("expected error message to mention IDEMPOTENCY_TTL, got %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("IDEMPOTENCY_MAX_KEYS validation fail-fast", func(t *testing.T) {
+		invalidCases := []struct {
+			name string
+			val  string
+		}{
+			{"invalid string", "not-a-number"},
+			{"zero", "0"},
+			{"negative", "-10"},
+			{"floating point", "10.5"},
+		}
+
+		for _, tc := range invalidCases {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := LoadFromLookup(func(k string) string {
+					if k == "IDEMPOTENCY_MAX_KEYS" {
+						return tc.val
+					}
+					return ""
+				})
+				if err == nil {
+					t.Fatalf("expected error for IDEMPOTENCY_MAX_KEYS=%q, got nil", tc.val)
+				}
+				if !strings.Contains(err.Error(), "IDEMPOTENCY_MAX_KEYS") {
+					t.Errorf("expected error message to mention IDEMPOTENCY_MAX_KEYS, got %v", err)
+				}
+			})
+		}
+	})
+}
